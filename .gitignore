@@ -1,5 +1,9 @@
-!Makefile
-!makefile
+Makefile
+makefile
+*.mk
+*.param
+*.yuv
+*.txt
 !*.cpp
 !*.c
 !*.h
