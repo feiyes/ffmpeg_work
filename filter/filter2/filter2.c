@@ -7,6 +7,8 @@
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
 
+#include "log.h"
+
 AVFilterContext *src_ctx = NULL;
 AVFilterContext *sink_ctx = NULL;
 AVFilterGraph *filter_graph = NULL;
@@ -20,7 +22,7 @@ int init_filters(const int width, const int height, const int format)
 
     filter_graph = avfilter_graph_alloc();
     if (!filter_graph) {
-        printf("avfilter_graph_alloc failed\n");
+        log_err("avfilter_graph_alloc failed\n");
         return -1;
     }
 
@@ -44,30 +46,30 @@ int init_filters(const int width, const int height, const int format)
 
     ret = avfilter_graph_parse2(filter_graph, filter_args, &inputs, &outputs);
     if (ret < 0) {
-        printf("avfilter_graph_parse2 failed, error(%s)\n", av_err2str(ret));
+        log_err("avfilter_graph_parse2 failed, error(%s)\n", av_err2str(ret));
         return ret;
     }
 
     ret = avfilter_graph_config(filter_graph, NULL);
     if (ret < 0) {
-        printf("avfilter_graph_config, error(%s)\n", av_err2str(ret));
+        log_err("avfilter_graph_config, error(%s)\n", av_err2str(ret));
         return ret;
     }
 
     // Get AVFilterContext from AVFilterGraph parsing from string
     src_ctx = avfilter_graph_get_filter(filter_graph, "Parsed_buffer_0");
     if (!src_ctx) {
-        printf("avfilter_graph_get_filter Parsed_buffer_0 failed\n");
+        log_err("avfilter_graph_get_filter Parsed_buffer_0 failed\n");
         return -1;
     }
 
     sink_ctx = avfilter_graph_get_filter(filter_graph, "Parsed_buffersink_5");
     if (!sink_ctx) {
-        printf("avfilter_graph_get_filter Parsed_buffersink_5 failed\n");
+        log_err("avfilter_graph_get_filter Parsed_buffersink_5 failed\n");
         return -1;
     }
 
-    printf("sink_width:%d, sink_height:%d\n",
+    log_err("sink_width:%d, sink_height:%d\n",
             av_buffersink_get_w(sink_ctx), av_buffersink_get_h(sink_ctx));
 
     return 0;
@@ -87,19 +89,19 @@ int main(int argc, char** argv)
 
     ret = init_filters(in_width, in_height, AV_PIX_FMT_YUV420P);
     if (ret < 0) {
-        printf("init_filters failed\n");
+        log_err("init_filters failed\n");
         return -1;
     }
 
     fp_in = fopen(in_file, "rb+");
     if (!fp_in) {
-        printf("fopen %s failed\n", in_file);
+        log_err("fopen %s failed\n", in_file);
         return -1;
     }
 
     fp_out = fopen(out_file, "wb");
     if (!fp_out) {
-        printf("fopen %s failed\n", out_file);
+        log_err("fopen %s failed\n", out_file);
         return -1;
     }
 
@@ -131,7 +133,7 @@ int main(int argc, char** argv)
 
         ret = av_buffersrc_add_frame(src_ctx, frame_in);
         if (ret < 0) {
-            printf("av_buffersrc_add_frame failed, error(%s)\n", av_err2str(ret));
+            log_err("av_buffersrc_add_frame failed, error(%s)\n", av_err2str(ret));
             break;
         }
 
@@ -154,7 +156,7 @@ int main(int argc, char** argv)
         }
 
         if (frame_count % 25 == 0)
-            printf("process %d frame\n", frame_count);
+            log_err("process %d frame\n", frame_count);
 
         ++frame_count;
         av_frame_unref(frame_out);

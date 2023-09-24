@@ -7,6 +7,8 @@
 #include <libavfilter/buffersrc.h>
 #include <libavfilter/buffersink.h>
 
+#include "log.h"
+
 int main(int argc, char** argv)
 {
     int ret = 0;
@@ -21,13 +23,13 @@ int main(int argc, char** argv)
 
     fp_in = fopen(in_file, "rb+");
     if (!fp_in) {
-        printf("fopen %s failed\n", in_file);
+        log_err("fopen %s failed\n", in_file);
         return -1;
     }
 
     fp_out = fopen(out_file, "wb");
     if (!fp_out) {
-        printf("fopen %s failed\n", out_file);
+        log_err("fopen %s failed\n", out_file);
         return -1;
     }
 
@@ -35,7 +37,7 @@ int main(int argc, char** argv)
 
     AVFilterGraph* filter_graph = avfilter_graph_alloc();
     if (!filter_graph) {
-        printf("avfilter_graph_alloc failed\n");
+        log_err("avfilter_graph_alloc failed\n");
         return -1;
     }
 
@@ -45,7 +47,7 @@ int main(int argc, char** argv)
                    in_width, in_height, AV_PIX_FMT_YUV420P, 1, 25, 1, 1);
     ret = avfilter_graph_create_filter(&src_ctx, src_buf, "in", args, NULL, filter_graph);
     if (ret < 0) {
-        printf("avfilter_graph_create_filter failed, error(%s)\n", av_err2str(ret));
+        log_err("avfilter_graph_create_filter failed, error(%s)\n", av_err2str(ret));
         return -1;
     }
 
@@ -53,7 +55,7 @@ int main(int argc, char** argv)
     const AVFilter* dst_buf = avfilter_get_by_name("buffersink");
     ret = avfilter_graph_create_filter(&sink_ctx, dst_buf, "out", NULL, "pix_fmts=0", filter_graph);
     if (ret < 0) {
-        printf("avfilter_graph_create_filter failed, error(%s)\n", av_err2str(ret));
+        log_err("avfilter_graph_create_filter failed, error(%s)\n", av_err2str(ret));
         return -1;
     }
 
@@ -61,7 +63,7 @@ int main(int argc, char** argv)
     const AVFilter *split_filter = avfilter_get_by_name("split");
     ret = avfilter_graph_create_filter(&split_ctx, split_filter, "split", "outputs=2", NULL, filter_graph);
     if (ret < 0) {
-        printf("avfilter_graph_create_filter failed, error(%s)\n", av_err2str(ret));
+        log_err("avfilter_graph_create_filter failed, error(%s)\n", av_err2str(ret));
         return -1;
     }
 
@@ -69,7 +71,7 @@ int main(int argc, char** argv)
     const AVFilter *crop_filter = avfilter_get_by_name("crop");
     ret = avfilter_graph_create_filter(&crop_ctx, crop_filter, "crop", "out_w=iw:out_h=ih/2:x=0:y=0", NULL, filter_graph);
     if (ret < 0) {
-        printf("avfilter_graph_create_filter failed, error(%s)\n", av_err2str(ret));
+        log_err("avfilter_graph_create_filter failed, error(%s)\n", av_err2str(ret));
         return -1;
     }
 
@@ -77,7 +79,7 @@ int main(int argc, char** argv)
     const AVFilter *vflip_filter = avfilter_get_by_name("vflip");
     ret = avfilter_graph_create_filter(&vflip_ctx, vflip_filter, "vflip", NULL, NULL, filter_graph);
     if (ret < 0) {
-        printf("avfilter_graph_create_filter failed, error(%s)\n", av_err2str(ret));
+        log_err("avfilter_graph_create_filter failed, error(%s)\n", av_err2str(ret));
         return -1;
     }
 
@@ -85,56 +87,56 @@ int main(int argc, char** argv)
     const AVFilter *overlay_filter = avfilter_get_by_name("overlay");
     ret = avfilter_graph_create_filter(&overlay_ctx, overlay_filter, "overlay", "0:H/2", NULL, filter_graph);
     if (ret < 0) {
-        printf("avfilter_graph_create_filter failed, error(%s)\n", av_err2str(ret));
+        log_err("avfilter_graph_create_filter failed, error(%s)\n", av_err2str(ret));
         return -1;
     }
 
     // src filter to split filter
     ret = avfilter_link(src_ctx, 0, split_ctx, 0);
     if (ret != 0) {
-        printf("avfilter_link src filter to split filter failed, error(%s)\n", av_err2str(ret));
+        log_err("avfilter_link src filter to split filter failed, error(%s)\n", av_err2str(ret));
         return -1;
     }
 
     // split filter's first pad to overlay filter's main pad
     ret = avfilter_link(split_ctx, 0, overlay_ctx, 0);
     if (ret != 0) {
-        printf("avfilter_link split filter to overlay filter main pad failed, error(%s)\n", av_err2str(ret));
+        log_err("avfilter_link split filter to overlay filter main pad failed, error(%s)\n", av_err2str(ret));
         return -1;
     }
 
     // split filter's second pad to crop filter
     ret = avfilter_link(split_ctx, 1, crop_ctx, 0);
     if (ret != 0) {
-        printf("avfilter_link split filter's second pad to crop filter failed, error(%s)\n", av_err2str(ret));
+        log_err("avfilter_link split filter's second pad to crop filter failed, error(%s)\n", av_err2str(ret));
         return -1;
     }
 
     // crop filter to vflip filter
     ret = avfilter_link(crop_ctx, 0, vflip_ctx, 0);
     if (ret != 0) {
-        printf("avfilter_link crop filter to vflip filter failed, error(%s)\n", av_err2str(ret));
+        log_err("avfilter_link crop filter to vflip filter failed, error(%s)\n", av_err2str(ret));
         return -1;
     }
 
     // vflip filter to overlay filter's second pad
     ret = avfilter_link(vflip_ctx, 0, overlay_ctx, 1);
     if (ret != 0) {
-        printf("avfilter_link vflip filter to overlay filter's second pad failed, error(%s)\n", av_err2str(ret));
+        log_err("avfilter_link vflip filter to overlay filter's second pad failed, error(%s)\n", av_err2str(ret));
         return -1;
     }
 
     // overlay filter to sink filter
     ret = avfilter_link(overlay_ctx, 0, sink_ctx, 0);
     if (ret != 0) {
-        printf("avfilter_link overlay filter to sink filter failed, error(%s)\n", av_err2str(ret));
+        log_err("avfilter_link overlay filter to sink filter failed, error(%s)\n", av_err2str(ret));
         return -1;
     }
 
     // check filter graph
     ret = avfilter_graph_config(filter_graph, NULL);
     if (ret < 0) {
-        printf("avfilter_graph_config failed, error(%s)\n", av_err2str(ret));
+        log_err("avfilter_graph_config failed, error(%s)\n", av_err2str(ret));
         return -1;
     }
 
@@ -168,7 +170,7 @@ int main(int argc, char** argv)
 
         ret = av_buffersrc_add_frame(src_ctx, frame_in);
         if (ret < 0) {
-            printf("av_buffersrc_add_frame failed, error(%s)\n", av_err2str(ret));
+            log_err("av_buffersrc_add_frame failed, error(%s)\n", av_err2str(ret));
             break;
         }
 
@@ -191,7 +193,7 @@ int main(int argc, char** argv)
         }
 
         if (frame_count % 25 == 0)
-            printf("process %d frame!\n",frame_count);
+            log_err("process %d frame!\n",frame_count);
 
         ++frame_count;
         av_frame_unref(frame_out);
