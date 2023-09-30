@@ -20,9 +20,9 @@ typedef struct filter_info {
     AVFilterGraph* filter_graph;
 } filter_info_t;
 
-const char* filters_descr = "[in]scale=400:224[out]";
-//const char* filters_descr = "drawbox=x=100:y=100:w=800:h=450:color=red";
-//const char* filters_descr = "drawtext=fontfile=方正粗黑宋简体.ttf:fontsize=32:fontcolor=red:text='Hello Word'";
+//const char* filters_descr = "[in]scale=1280:360[out]";
+//const char* filters_descr = "drawbox=x=100:y=100:w=800:h=200:color=red";
+const char* filters_descr = "drawtext=fontfile=方正粗黑宋简体.ttf:fontsize=32:fontcolor=red:text='Hello Word'";
 
 static int init_filter_graph(filter_info_t* filter_info)
 {
@@ -104,7 +104,7 @@ static struct option long_options[] = {
 
 static void help_message()
 {
-    fprintf(stderr, "./filter3 -i lh_online.yuv -o lh_online_out.yuv -w 800 -h 450 -f 0 -W 400 -H 224 -F 0\n");
+    fprintf(stderr, "./filter3 -i 1280_720_yuv420p.yuv -o 1280_720_yuv420p_out.yuv -w 1280 -h 720 -f 0 -W 1280 -H 360 -F 0\n");
 }
 
 int main(int argc, char* argv[])
@@ -124,10 +124,10 @@ int main(int argc, char* argv[])
     char out_file[256] = {'\0'};
     filter_info_t filter_info = {0};
 
-    filter_info.in_width       = 800;
-    filter_info.in_height      = 450;
-    filter_info.out_width      = 800;
-    filter_info.out_height     = 450;
+    filter_info.in_width       = 1280;
+    filter_info.in_height      = 720;
+    filter_info.out_width      = 1280;
+    filter_info.out_height     = 720;
     filter_info.time_base_den  = 25;
     filter_info.in_fmt         = AV_PIX_FMT_YUV420P;
     filter_info.out_fmt        = AV_PIX_FMT_YUV420P;
