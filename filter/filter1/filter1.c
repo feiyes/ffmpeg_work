@@ -193,7 +193,7 @@ int main(int argc, char** argv)
         }
 
         if (frame_count % 25 == 0)
-            log_err("process %d frame!\n",frame_count);
+            log_info("process %d frame\n",frame_count);
 
         ++frame_count;
         av_frame_unref(frame_out);

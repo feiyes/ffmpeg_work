@@ -40,8 +40,7 @@ AVPacket* enc_pkt;
 //const char* filters_descr = "[in]scale=640:240[out]";
 //const char* filters_descr = "movie=ring_logo.jpg,scale=80:50[wm];[in][wm]overlay=0:0,scale=640:240[out]";
 //const char* filters_descr = "drawbox=x=100:y=100:w=100:h=100:color=red";
-//const char* filters_descr = "drawtext=fontfile=方正粗黑宋简体.ttf:fontsize=32:fontcolor=red:text='Hello Word'";
-const char* filters_descr = "drawtext=fontcolor=red:text='Hello Word'";
+const char* filters_descr = "drawtext=fontfile=方正粗黑宋简体.ttf:fontsize=32:fontcolor=red:text='Hello Word'";
 
 static void encode_process()
 {

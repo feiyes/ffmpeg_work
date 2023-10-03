@@ -170,24 +170,24 @@ int main(int argc, char* argv[])
     stream_info_t stream = {0};
 
     while ((c = getopt_long(argc, argv, ":i:o:l:f:h:a", long_options, NULL)) != -1) {
-    switch (c) {
-    case 'i':
-        strncpy(mp4_file, optarg, strlen(optarg));
-        break;
-    case 'o':
-        strncpy(stream_file, optarg, strlen(optarg));
-        break;
-    case 'f':
-        stream.enable_filter = atoi(optarg) ? true : false;
-        break;
-    case 'l':
-        stream.enable_loop = atoi(optarg) ? true : false;
-        break;
-    case 'h':
-        break;
-    default:
-        return -1;
-    }
+        switch (c) {
+        case 'i':
+            strncpy(mp4_file, optarg, strlen(optarg));
+            break;
+        case 'o':
+            strncpy(stream_file, optarg, strlen(optarg));
+            break;
+        case 'f':
+            stream.enable_filter = atoi(optarg) ? true : false;
+            break;
+        case 'l':
+            stream.enable_loop = atoi(optarg) ? true : false;
+            break;
+        case 'h':
+            break;
+        default:
+            return -1;
+        }
     }
 
     if (strcmp(mp4_file, "\0") == 0 || strcmp(stream_file, "\0") == 0) {
