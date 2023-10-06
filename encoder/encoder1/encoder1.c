@@ -9,6 +9,7 @@
 #include <libavutil/imgutils.h>
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
+#include <libavformat/avformat.h>
 
 #include "log.h"
 
@@ -20,36 +21,57 @@ int64_t get_time_ms()
     return av_gettime_relative() / 1000;
 }
 
-static int encode_process(AVCodecContext *enc_ctx, AVFrame *frame, AVPacket *pkt, FILE *fp_out)
+typedef struct EncoderContext {
+    FILE *fp;
+    AVStream* stream;
+    const AVCodec * codec;
+    AVCodecContext *codec_context;
+    AVFormatContext* format_context;
+} EncoderContext;
+
+static int encode_process(EncoderContext* ctx, AVFrame *frame, AVPacket *packet)
 {
     int ret;
 
     if (frame)
         log_info("send %d frame, pts %3"PRId64, send_frame_count, frame->pts);
 
-    ret = avcodec_send_frame(enc_ctx, frame);
+    ret = avcodec_send_frame(ctx->codec_context, frame);
     if (ret < 0) {
         log_err("avcodec_send_frame, error(%s)\n", av_err2str(ret));
         return -1;
     }
 
     while (ret >= 0) {
-        ret = avcodec_receive_packet(enc_ctx, pkt);
+        ret = avcodec_receive_packet(ctx->codec_context, packet);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
             return 0;
         } else if (ret < 0) {
-            log_err("avcodec_receive_packet, error(%s)\n", av_err2str(ret));
+            log_err("avcodec_receive_packet failed, error(%s)\n", av_err2str(ret));
             return -1;
         }
 
-        if (pkt->flags & AV_PKT_FLAG_KEY)
-            log_info("receive %d frame(key), pts:%3"PRId64" dts:%3"PRId64" size:%d", get_frame_count, pkt->pts, pkt->dts, pkt->size);
+        if (packet->flags & AV_PKT_FLAG_KEY)
+            log_info("receive %d frame(key), pts:%3"PRId64" dts:%3"PRId64" size:%d",
+                      get_frame_count, packet->pts, packet->dts, packet->size);
 
-        if (!pkt->flags)
-            log_info("receive %d frame(non-key), pts:%3"PRId64" dts:%3"PRId64" size:%d", get_frame_count, pkt->pts, pkt->dts, pkt->size);
+        if (!packet->flags)
+            log_info("receive %d frame(non-key), pts:%3"PRId64" dts:%3"PRId64" size:%d",
+                      get_frame_count, packet->pts, packet->dts, packet->size);
+
+        if (ctx->codec->id == AV_CODEC_ID_MPEG4) {
+            packet->stream_index = 0;
+            av_packet_rescale_ts(packet, ctx->codec_context->time_base, ctx->stream->time_base);
+            ret = av_interleaved_write_frame(ctx->format_context, packet);
+            if (ret < 0) {
+                log_err("av_interleaved_write_frame failed, error(%s)\n", av_err2str(ret));
+                return -1;
+            }
+        } else {
+            fwrite(packet->data, 1, packet->size, ctx->fp);
+        }
 
         get_frame_count++;
-        fwrite(pkt->data, 1, pkt->size, fp_out);
     }
 
     return 0;
@@ -92,7 +114,6 @@ int main(int argc, char **argv)
     int dst_h = 720;
     int need_size = -1;
     FILE *fp_in  = NULL;
-    FILE *fp_out = NULL;
     AVFrame *enc_frame = NULL;
     AVFrame *sws_frame = NULL;
     bool enable_filter = false;
@@ -107,6 +128,8 @@ int main(int argc, char **argv)
     struct SwsContext* sws_ctx = NULL;
     enum AVPixelFormat src_pix_fmt = AV_PIX_FMT_YUV420P;
     enum AVPixelFormat dst_pix_fmt = AV_PIX_FMT_YUV420P;
+
+    EncoderContext ctx = {0};
 
     while ((c = getopt_long(argc, argv, ":i:o:c:g:l:f:F:p:P:w:W:h:H:a", long_options, NULL)) != -1) {
         switch (c) {
@@ -166,77 +189,122 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    fp_out = fopen(stream_file, "wb");
-    if (!fp_out) {
-        log_err("fopen %s failed\n", stream_file);
-        return -1;
-    }
-
-    const AVCodec *codec = avcodec_find_encoder_by_name(codec_name);
-    if (!codec) {
+    ctx.codec = avcodec_find_encoder_by_name(codec_name);
+    if (!ctx.codec) {
         log_err("avcodec_find_encoder_by_name %s failed\n", codec_name);
         return -1;
     }
 
-    AVCodecContext *codec_ctx = avcodec_alloc_context3(codec);
-    if (!codec_ctx) {
+    ctx.codec_context = avcodec_alloc_context3(ctx.codec);
+    if (!ctx.codec_context) {
         log_err("avcodec_alloc_context3 failed\n");
         return -1;
     }
 
-    codec_ctx->gop_size         = gop;
-    codec_ctx->max_b_frames     = 2;
-    codec_ctx->time_base        = (AVRational){1, fps};
-    codec_ctx->framerate        = (AVRational){fps, 1};
-    codec_ctx->bit_rate         = 3000000;
-    codec_ctx->rc_max_rate      = 3000000;
-    codec_ctx->rc_min_rate      = 3000000;
-    codec_ctx->rc_buffer_size   = 2000000;
-    //codec_ctx->thread_count   = 4;
-    //codec_ctx->thread_type    = FF_THREAD_FRAME;
-    //codec_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    ctx.codec_context->gop_size         = gop;
+    ctx.codec_context->max_b_frames     = 2;
+    ctx.codec_context->time_base        = (AVRational){1, fps};
+    ctx.codec_context->framerate        = (AVRational){fps, 1};
+    ctx.codec_context->bit_rate         = 3000000;
+    ctx.codec_context->rc_max_rate      = 3000000;
+    ctx.codec_context->rc_min_rate      = 3000000;
+    ctx.codec_context->rc_buffer_size   = 2000000;
+    //ctx.codec_context->thread_count   = 4;
+    //ctx.codec_context->thread_type    = FF_THREAD_FRAME;
+    //ctx.codec_context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
     if (enable_filter) {
-        codec_ctx->width            = dst_w;
-        codec_ctx->height           = dst_h;
-        codec_ctx->pix_fmt          = dst_pix_fmt;
+        ctx.codec_context->width            = dst_w;
+        ctx.codec_context->height           = dst_h;
+        ctx.codec_context->pix_fmt          = dst_pix_fmt;
     } else {
-        codec_ctx->width            = src_w;
-        codec_ctx->height           = src_h;
-        codec_ctx->pix_fmt          = src_pix_fmt;
+        ctx.codec_context->width            = src_w;
+        ctx.codec_context->height           = src_h;
+        ctx.codec_context->pix_fmt          = src_pix_fmt;
     }
 
-    if (codec->id == AV_CODEC_ID_H264) {
-        ret = av_opt_set(codec_ctx->priv_data, "preset", "medium", 0);
+    if (ctx.codec->id == AV_CODEC_ID_H264) {
+        ret = av_opt_set(ctx.codec_context->priv_data, "preset", "medium", 0);
         if (ret < 0) {
             log_err("av_opt_set preset failed, error(%s)", av_err2str(ret));
             return ret;
         }
 
-        ret = av_opt_set(codec_ctx->priv_data, "profile", "main", 0);
+        ret = av_opt_set(ctx.codec_context->priv_data, "profile", "main", 0);
         if (ret < 0) {
             log_err("av_opt_set profile failed, error(%s)", av_err2str(ret));
             return -1;
         }
 
         if (lowdelay)
-            ret = av_opt_set(codec_ctx->priv_data, "tune","zerolatency",0);
+            ret = av_opt_set(ctx.codec_context->priv_data, "tune","zerolatency",0);
         else
-            ret = av_opt_set(codec_ctx->priv_data, "tune","film",0);
+            ret = av_opt_set(ctx.codec_context->priv_data, "tune","film",0);
         if (ret < 0) {
             log_err("av_opt_set tune failed, error(%s)", av_err2str(ret));
             return -1;
         }
     }
 
-    ret = avcodec_open2(codec_ctx, codec, NULL);
+    ret = avcodec_open2(ctx.codec_context, ctx.codec, NULL);
     if (ret) {
         log_err("avcodec_open2 failed, error(%s)", av_err2str(ret));
         return -1;
     }
 
-    AVPacket *pkt = av_packet_alloc();
-    if (!pkt) {
+    if (ctx.codec->id == AV_CODEC_ID_MPEG4) {
+        ctx.format_context = avformat_alloc_context();
+        if (!ctx.format_context) {
+            log_err("avformat_alloc_context failed\n");
+            return -1;
+        }
+
+        ret = avformat_alloc_output_context2(&ctx.format_context, NULL, NULL, stream_file);
+        if (ret < 0) {
+            log_err("avformat_alloc_output_context2 failed, error(%s)", av_err2str(ret));
+            return -1;
+
+        }
+
+        ctx.stream = avformat_new_stream(ctx.format_context, NULL);
+        if (!ctx.stream) {
+            log_err("avformat_new_stream failed\n");
+            return -1;
+        }
+
+        ret = avcodec_parameters_from_context(ctx.stream->codecpar, ctx.codec_context);
+        if (ret < 0) {
+            log_err("avcodec_parameters_from_context failed, error(%s)", av_err2str(ret));
+            return -1;
+        }
+
+        ctx.stream->time_base = ctx.codec_context->time_base;
+    }
+
+    if (ctx.codec->id == AV_CODEC_ID_MPEG4) {
+        if (!(ctx.format_context->oformat->flags & AVFMT_NOFILE)) {
+            ret = avio_open(&ctx.format_context->pb, stream_file, AVIO_FLAG_WRITE);
+            if (ret < 0) {
+                log_err("avio_open %s failed\n", stream_file);
+                return ret;
+            }
+        }
+
+        ret = avformat_write_header(ctx.format_context, NULL);
+        if (ret < 0) {
+            log_err("avformat_write_header failed, error(%s)", av_err2str(ret));
+            return -1;
+        }
+    } else {
+        ctx.fp = fopen(stream_file, "wb");
+        if (!ctx.fp) {
+            log_err("fopen %s failed\n", stream_file);
+            return -1;
+        }
+    }
+
+    AVPacket *packet = av_packet_alloc();
+    if (!packet) {
         log_err("av_packet_alloc failed\n");
         return -1;
     }
@@ -247,9 +315,9 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    enc_frame->width  = codec_ctx->width;
-    enc_frame->height = codec_ctx->height;
-    enc_frame->format = codec_ctx->pix_fmt;
+    enc_frame->width  = ctx.codec_context->width;
+    enc_frame->height = ctx.codec_context->height;
+    enc_frame->format = ctx.codec_context->pix_fmt;
     ret = av_frame_get_buffer(enc_frame, 0);
     if (ret < 0) {
         log_err("av_frame_get_buffer, error(%s)\n", av_err2str(ret));
@@ -288,7 +356,7 @@ int main(int argc, char **argv)
     }
 
     log_info("thread_count = %d, thread_type = %d, src_framebuf_len = %d",
-              codec_ctx->thread_count, codec_ctx->thread_type, src_framebuf_len);
+              ctx.codec_context->thread_count, ctx.codec_context->thread_type, src_framebuf_len);
 
     log_info("encoder start");
     start_time = get_time_ms();
@@ -304,9 +372,9 @@ int main(int argc, char **argv)
             ret = av_frame_make_writable(enc_frame);
             if (ret < 0) {
                 if (enc_frame->buf && enc_frame->buf[0])
-                    log_err("av_frame_make_writable failed, ret = %d, ref_count = %d\n", ret, av_buffer_get_ref_count(enc_frame->buf[0]));
+                    log_err("av_frame_make_writable failed, ref_count = %d, error(%s)\n", av_buffer_get_ref_count(enc_frame->buf[0]), av_err2str(ret));
                 else
-                    log_err("av_frame_make_writable failed, ret = %d\n", ret);
+                    log_err("av_frame_make_writable failed, error(%s)\n", av_err2str(ret));
                 break;
             }
         }
@@ -318,7 +386,7 @@ int main(int argc, char **argv)
                 break;
             }
 
-            sws_scale(sws_ctx, sws_frame->data, sws_frame->linesize, 0, src_h, enc_frame->data, enc_frame->linesize);
+            sws_scale(sws_ctx, (const uint8_t **)sws_frame->data, sws_frame->linesize, 0, src_h, enc_frame->data, enc_frame->linesize);
         } else {
             need_size = av_image_fill_arrays(enc_frame->data, enc_frame->linesize, yuv_buf, enc_frame->format, enc_frame->width, enc_frame->height, 1);
             if (need_size != src_framebuf_len) {
@@ -329,7 +397,7 @@ int main(int argc, char **argv)
 
         enc_frame->pts = pts;
         start_frame_time = get_time_ms();
-        ret = encode_process(codec_ctx, enc_frame, pkt, fp_out);
+        ret = encode_process(&ctx, enc_frame, packet);
         end_frame_time = get_time_ms();
 
         log_info("encode %d frame, time:%ldms", send_frame_count, end_frame_time - start_frame_time);
@@ -341,30 +409,27 @@ int main(int argc, char **argv)
         send_frame_count++;
     }
 
-    encode_process(codec_ctx, NULL, pkt, fp_out);
+    encode_process(&ctx, NULL, packet);
+
+    if (ctx.codec->id == AV_CODEC_ID_MPEG4) {
+        av_write_trailer(ctx.format_context);
+    }
 
     end_time = get_time_ms();
     log_info("total encode time:%ldms", end_time - start_time);
 
-    if (fp_in) {
-        fclose(fp_in);
-    }
+    if (fp_in) fclose(fp_in);
+    if (yuv_buf) free(yuv_buf);
+    if (ctx.fp) fclose(ctx.fp);
+    if (packet) av_packet_free(&packet);
+    if (enc_frame) av_frame_free(&enc_frame);
+    if (enable_filter) av_frame_free(&sws_frame);
+    if (ctx.codec_context) avcodec_free_context(&ctx.codec_context);
 
-    if (fp_out) {
-        fclose(fp_out);
+    if (ctx.codec->id == AV_CODEC_ID_MPEG4) {
+        avio_close(ctx.format_context->pb);
+        avformat_free_context(ctx.format_context);
     }
-
-    if (yuv_buf) {
-        free(yuv_buf);
-    }
-
-    if (enable_filter) {
-        av_frame_free(&sws_frame);
-    }
-
-    av_frame_free(&enc_frame);
-    av_packet_free(&pkt);
-    avcodec_free_context(&codec_ctx);
 
     log_info("encoder ended, press enter to exit");
     getchar();
