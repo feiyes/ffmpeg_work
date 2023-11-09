@@ -59,12 +59,13 @@ int read_mp4_info(char *mp4_file, stream_info_t* stream)
 
 int extract_mp4_stream(char* stream_file, stream_info_t* stream)
 {
-    int ret;
+    int ret = 0;
+    int len = 0;
     FILE *fp = NULL;
-    AVPacket *packet;
+    AVPacket *packet = NULL;
     AVBSFContext *bsf_ctx = NULL;
     int video_index = stream->video_index;
-    const AVBitStreamFilter *filter;
+    const AVBitStreamFilter *filter = NULL;
     AVFormatContext *fmt_ctx = stream->fmt_ctx;
 
     fp = fopen(stream_file, "wb");
@@ -73,9 +74,15 @@ int extract_mp4_stream(char* stream_file, stream_info_t* stream)
         return -1;
     }
 
-    if (stream->codec != AV_CODEC_ID_H264 && stream->codec != AV_CODEC_ID_H265) {
+    switch (stream->codec) {
+    case AV_CODEC_ID_H264:
+    case AV_CODEC_ID_H265:
+    case AV_CODEC_ID_MJPEG:
+    case AV_CODEC_ID_JPEGLS:
+        break;
+    default:
         log_err("unsupport video codec %d", stream->codec);
-        return -1;
+        return -2;
     }
 
     if (stream->enable_filter == true) {
@@ -83,12 +90,16 @@ int extract_mp4_stream(char* stream_file, stream_info_t* stream)
             av_bsf_list_parse_str("h264_mp4toannexb,filter_units=pass_types=1-8,extract_extradata,h264_metadata", &bsf_ctx);
         } else if (stream->codec == AV_CODEC_ID_H265) {
             av_bsf_list_parse_str("hevc_mp4toannexb,filter_units=remove_types=35|38,extract_extradata,hevc_metadata", &bsf_ctx);
+        } else if (stream->codec == AV_CODEC_ID_MJPEG) {
+            av_bsf_list_parse_str("mjpeg2jpeg", &bsf_ctx);
         }
     } else {
         if (stream->codec == AV_CODEC_ID_H264) {
             filter = av_bsf_get_by_name("h264_mp4toannexb");
         } else if (stream->codec == AV_CODEC_ID_H265) {
             filter = av_bsf_get_by_name("hevc_mp4toannexb");
+        } else if (stream->codec == AV_CODEC_ID_MJPEG) {
+            filter = av_bsf_get_by_name("mjpeg2jpeg");
         }
 
         if (!filter) {
@@ -131,14 +142,28 @@ int extract_mp4_stream(char* stream_file, stream_info_t* stream)
             continue;
 
         av_bsf_send_packet(bsf_ctx, packet);
+
         ret = av_bsf_receive_packet(bsf_ctx, packet);
         if (ret) {
             log_err("av_bsf_receive_packet failed, error(%s)", av_err2str(ret));
             continue;
         }
 
+        if (stream->codec == AV_CODEC_ID_JPEGLS || stream->codec == AV_CODEC_ID_MJPEG) {
+            int i = 0;
+            for (i = 0; i < packet->size -1; i++) {
+                if (packet->data[i] == 0xFF && packet->data[i + 1] == 0xD9)
+                    break;
+            }
+
+            len = i + 2;
+        } else {
+            len = packet->size;
+        }
+
         if (fp) {
-            fwrite(packet->data, packet->size, 1, fp);
+            log_info("write packet, size %d", len);
+            fwrite(packet->data, len, 1, fp);
         }
 
         av_packet_unref(packet);
