@@ -147,11 +147,22 @@ int main(int argc, char* argv[])
             data += len;
             data_size -= len;
 
-            log_info("send video %c frame, width = %d(%d), height = %d(%d) format = %d, pts = %lu, codec = %s",
-                      av_get_picture_type_char(parser->pict_type), parser->coded_width, parser->width,
-                      parser->coded_height, parser->height, parser->format, parser->pts, avcodec_get_name(parser->parser->codec_ids[0]));
-
             if (packet->size) {
+                if (codec_id == AV_CODEC_ID_JPEGLS) {
+                    int i = 0;
+                    for (i = 0; i < packet->size -1; i++) {
+                        if (packet->data[i] == 0xFF && packet->data[i + 1] == 0xD9)
+                            break;
+                    }
+
+                    packet->size = i + 2;
+                }
+
+                log_info("send video %c frame, codec = %s, width = %d(%d), height = %d(%d) %d",
+                          av_get_picture_type_char(parser->pict_type), avcodec_get_name(parser->parser->codec_ids[0]),
+                          parser->coded_width, parser->width,
+                          parser->coded_height, parser->height, packet->size);
+
                 decode_process(context, frame, packet, fp_out);
             }
             else if (eof)
