@@ -264,14 +264,14 @@ static int init_filter(FilteringContext* fctx, AVCodecContext *dec_ctx,
         snprintf(args, sizeof(args),
                 "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
                 dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
-                dec_ctx->time_base.num, dec_ctx->time_base.den,
+                dec_ctx->time_base.num ? dec_ctx->time_base.num : 1, dec_ctx->time_base.den,
                 dec_ctx->sample_aspect_ratio.num,
                 dec_ctx->sample_aspect_ratio.den);
 
         ret = avfilter_graph_create_filter(&buffersrc_ctx, buffersrc, "in",
                 args, NULL, filter_graph);
         if (ret < 0) {
-            av_log(NULL, AV_LOG_ERROR, "Cannot create buffer source\n");
+            av_log(NULL, AV_LOG_ERROR, "Cannot create buffer source, error(%s, %s)\n", av_err2str(ret), args);
             goto end;
         }
 
