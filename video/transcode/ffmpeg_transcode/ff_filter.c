@@ -28,7 +28,7 @@ int init_filter(FilteringContext* fctx, AVCodecContext *dec_ctx,
         buffersrc = avfilter_get_by_name("buffer");
         buffersink = avfilter_get_by_name("buffersink");
         if (!buffersrc || !buffersink) {
-            av_log(NULL, AV_LOG_ERROR, "filtering source or sink element not found\n");
+            log_err("filtering source or sink element not found\n");
             ret = AVERROR_UNKNOWN;
             goto end;
         }
@@ -44,14 +44,14 @@ int init_filter(FilteringContext* fctx, AVCodecContext *dec_ctx,
         ret = avfilter_graph_create_filter(&buffersrc_ctx, buffersrc, "in",
                 args, NULL, filter_graph);
         if (ret < 0) {
-            av_log(NULL, AV_LOG_ERROR, "Cannot create buffer source, error(%s, %s)\n", av_err2str(ret), args);
+            log_err("avfilter_graph_create_filter video buffer failed, error(%s, %s)\n", av_err2str(ret), args);
             goto end;
         }
 
         ret = avfilter_graph_create_filter(&buffersink_ctx, buffersink, "out",
                 NULL, NULL, filter_graph);
         if (ret < 0) {
-            av_log(NULL, AV_LOG_ERROR, "Cannot create buffer sink\n");
+            log_err("avfilter_graph_create_filter video buffer failed, error(%s)\n", av_err2str(ret));
             goto end;
         }
 
@@ -59,7 +59,7 @@ int init_filter(FilteringContext* fctx, AVCodecContext *dec_ctx,
                 (uint8_t*)&enc_ctx->pix_fmt, sizeof(enc_ctx->pix_fmt),
                 AV_OPT_SEARCH_CHILDREN);
         if (ret < 0) {
-            av_log(NULL, AV_LOG_ERROR, "Cannot set output pixel format\n");
+            log_err("av_opt_set_bin failed, error(%s)\n", av_err2str(ret));
             goto end;
         }
     } else if (dec_ctx->codec_type == AVMEDIA_TYPE_AUDIO) {
@@ -67,7 +67,7 @@ int init_filter(FilteringContext* fctx, AVCodecContext *dec_ctx,
         buffersrc = avfilter_get_by_name("abuffer");
         buffersink = avfilter_get_by_name("abuffersink");
         if (!buffersrc || !buffersink) {
-            av_log(NULL, AV_LOG_ERROR, "filtering source or sink element not found\n");
+            log_err("filtering source or sink element not found\n");
             ret = AVERROR_UNKNOWN;
             goto end;
         }
@@ -83,7 +83,7 @@ int init_filter(FilteringContext* fctx, AVCodecContext *dec_ctx,
         ret = avfilter_graph_create_filter(&buffersrc_ctx, buffersrc, "in",
                 args, NULL, filter_graph);
         if (ret < 0) {
-            av_log(NULL, AV_LOG_ERROR, "Cannot create audio buffer source\n");
+            log_err("avfilter_graph_create_filter audio buffer failed, error(%s, %s)\n", av_err2str(ret), args);
             goto end;
         }
 
@@ -91,7 +91,7 @@ int init_filter(FilteringContext* fctx, AVCodecContext *dec_ctx,
         ret = avfilter_graph_create_filter(&buffersink_ctx, buffersink, "out",
                 NULL, NULL, filter_graph);
         if (ret < 0) {
-            av_log(NULL, AV_LOG_ERROR, "Cannot create audio buffer sink\n");
+            log_err("avfilter_graph_create_filter audio buffer failed, error(%s)\n", av_err2str(ret));
             goto end;
         }
 
@@ -99,7 +99,7 @@ int init_filter(FilteringContext* fctx, AVCodecContext *dec_ctx,
                 (uint8_t*)&enc_ctx->sample_fmt, sizeof(enc_ctx->sample_fmt),
                 AV_OPT_SEARCH_CHILDREN);
         if (ret < 0) {
-            av_log(NULL, AV_LOG_ERROR, "Cannot set output sample format\n");
+            log_err("av_opt_set_bin failed, error(%s)\n", av_err2str(ret));
             goto end;
         }
 
@@ -107,7 +107,7 @@ int init_filter(FilteringContext* fctx, AVCodecContext *dec_ctx,
         ret = av_opt_set(buffersink_ctx, "ch_layouts",
                          buf, AV_OPT_SEARCH_CHILDREN);
         if (ret < 0) {
-            av_log(NULL, AV_LOG_ERROR, "Cannot set output channel layout\n");
+            log_err("av_opt_set failed, error(%s)\n", av_err2str(ret));
             goto end;
         }
 
@@ -115,7 +115,7 @@ int init_filter(FilteringContext* fctx, AVCodecContext *dec_ctx,
                 (uint8_t*)&enc_ctx->sample_rate, sizeof(enc_ctx->sample_rate),
                 AV_OPT_SEARCH_CHILDREN);
         if (ret < 0) {
-            av_log(NULL, AV_LOG_ERROR, "Cannot set output sample rate\n");
+            log_err("av_opt_set_bin failed, error(%s)\n", av_err2str(ret));
             goto end;
         }
     } else {
@@ -139,12 +139,18 @@ int init_filter(FilteringContext* fctx, AVCodecContext *dec_ctx,
         goto end;
     }
 
-    if ((ret = avfilter_graph_parse_ptr(filter_graph, filter_spec,
-                    &inputs, &outputs, NULL)) < 0)
+    ret = avfilter_graph_parse_ptr(filter_graph, filter_spec,
+                    &inputs, &outputs, NULL);
+    if (ret < 0) {
+        log_err("avfilter_graph_parse_ptr failed, error(%s)\n", av_err2str(ret));
         goto end;
+    }
 
-    if ((ret = avfilter_graph_config(filter_graph, NULL)) < 0)
+    ret = avfilter_graph_config(filter_graph, NULL);
+    if (ret < 0) {
+        log_err("avfilter_graph_config failed, error(%s)\n", av_err2str(ret));
         goto end;
+    }
 
     /* Fill FilteringContext */
     fctx->buffersrc_ctx = buffersrc_ctx;
@@ -204,7 +210,6 @@ int ff_init_filters(TranscodeContext *transcode_context)
     return 0;
 }
 
-
 int ff_filter_encode_write_frame(AVFrame *frame, unsigned int stream_index, TranscodeContext *transcode_context)
 {
     StreamContext *stream_ctx = transcode_context->stream_ctx;
@@ -216,7 +221,7 @@ int ff_filter_encode_write_frame(AVFrame *frame, unsigned int stream_index, Tran
     ret = av_buffersrc_add_frame_flags(filter->buffersrc_ctx,
             frame, 0);
     if (ret < 0) {
-        av_log(NULL, AV_LOG_ERROR, "Error while feeding the filtergraph\n");
+        log_err("av_buffersrc_add_frame_flags failed, error(%s)\n", av_err2str(ret));
         return ret;
     }
 

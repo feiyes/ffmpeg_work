@@ -23,6 +23,8 @@ typedef struct StreamContext {
 } StreamContext;
 
 typedef struct TransCodeContext {
+    char acodec_name[16];
+    char vcodec_name[16];
     AVFormatContext *ifmt_ctx;
     AVFormatContext *ofmt_ctx;
     StreamContext *stream_ctx;

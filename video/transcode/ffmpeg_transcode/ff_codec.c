@@ -1,3 +1,4 @@
+#include "log.h"
 #include "ff_codec.h"
 
 int ff_encode_write_frame(unsigned int stream_index, int flush, StreamContext *stream_ctx, FilteringContext *filter_ctx, AVFormatContext *ofmt_ctx)
@@ -13,9 +14,10 @@ int ff_encode_write_frame(unsigned int stream_index, int flush, StreamContext *s
     av_packet_unref(enc_pkt);
 
     ret = avcodec_send_frame(stream->enc_ctx, filt_frame);
-
-    if (ret < 0)
+    if (ret < 0) {
+        log_err("avcodec_send_frame failed, error(%s)\n", av_err2str(ret));
         return ret;
+    }
 
     while (ret >= 0) {
         ret = avcodec_receive_packet(stream->enc_ctx, enc_pkt);
@@ -32,6 +34,10 @@ int ff_encode_write_frame(unsigned int stream_index, int flush, StreamContext *s
         av_log(NULL, AV_LOG_DEBUG, "Muxing frame\n");
         /* mux encoded frame */
         ret = av_interleaved_write_frame(ofmt_ctx, enc_pkt);
+        if (ret < 0) {
+            log_err("av_interleaved_write_frame failed, error(%s)\n", av_err2str(ret));
+        }
+
     }
 
     return ret;

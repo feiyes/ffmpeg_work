@@ -1,3 +1,4 @@
+#include "log.h"
 #include "ff_open_file.h"
 
 int ff_open_input_file(const char *filename, TranscodeContext *transcode_context)
@@ -8,13 +9,15 @@ int ff_open_input_file(const char *filename, TranscodeContext *transcode_context
     AVFormatContext *ifmt_ctx = NULL;
     StreamContext *stream_ctx = NULL;
 
-    if ((ret = avformat_open_input(&ifmt_ctx, filename, NULL, NULL)) < 0) {
-        av_log(NULL, AV_LOG_ERROR, "Cannot open input file\n");
+    ret = avformat_open_input(&ifmt_ctx, filename, NULL, NULL);
+    if (ret < 0) {
+        log_err("avformat_open_input failed, error(%s)\n", av_err2str(ret));
         return ret;
     }
 
-    if ((ret = avformat_find_stream_info(ifmt_ctx, NULL)) < 0) {
-        av_log(NULL, AV_LOG_ERROR, "Cannot find stream information\n");
+    ret = avformat_find_stream_info(ifmt_ctx, NULL);
+    if (ret < 0) {
+        log_err("avformat_find_stream_info failed, error(%s)\n", av_err2str(ret));
         return ret;
     }
 
@@ -27,20 +30,22 @@ int ff_open_input_file(const char *filename, TranscodeContext *transcode_context
         const AVCodec *dec = avcodec_find_decoder(stream->codecpar->codec_id);
         AVCodecContext *codec_ctx;
         if (!dec) {
-            av_log(NULL, AV_LOG_ERROR, "Failed to find decoder for stream #%u\n", i);
+            log_err("avcodec_find_decoder stream #%u failed\n", i);
             return AVERROR_DECODER_NOT_FOUND;
         }
+
         codec_ctx = avcodec_alloc_context3(dec);
         if (!codec_ctx) {
-            av_log(NULL, AV_LOG_ERROR, "Failed to allocate the decoder context for stream #%u\n", i);
+            log_err("avcodec_alloc_context3 stream #%u failed\n", i);
             return AVERROR(ENOMEM);
         }
+
         ret = avcodec_parameters_to_context(codec_ctx, stream->codecpar);
         if (ret < 0) {
-            av_log(NULL, AV_LOG_ERROR, "Failed to copy decoder parameters to input decoder context "
-                   "for stream #%u\n", i);
+            log_err("avcodec_parameters_to_context stream #%u failed, error(%s)\n", i, av_err2str(ret));
             return ret;
         }
+
         /* Reencode video & audio and remux subtitles etc. */
         if (codec_ctx->codec_type == AVMEDIA_TYPE_VIDEO
                 || codec_ctx->codec_type == AVMEDIA_TYPE_AUDIO) {
@@ -49,10 +54,11 @@ int ff_open_input_file(const char *filename, TranscodeContext *transcode_context
             /* Open decoder */
             ret = avcodec_open2(codec_ctx, dec, NULL);
             if (ret < 0) {
-                av_log(NULL, AV_LOG_ERROR, "Failed to open decoder for stream #%u\n", i);
+                log_err("avcodec_open2 stream #%u failed, error(%s)\n", i, av_err2str(ret));
                 return ret;
             }
         }
+
         stream_ctx[i].dec_ctx = codec_ctx;
 
         stream_ctx[i].dec_frame = av_frame_alloc();
@@ -64,6 +70,7 @@ int ff_open_input_file(const char *filename, TranscodeContext *transcode_context
     transcode_context->stream_ctx = stream_ctx;
 
     av_dump_format(ifmt_ctx, 0, filename, 0);
+
     return 0;
 }
 
@@ -82,14 +89,14 @@ int ff_open_output_file(const char *filename, TranscodeContext *transcode_contex
 
     avformat_alloc_output_context2(&ofmt_ctx, NULL, NULL, filename);
     if (!ofmt_ctx) {
-        av_log(NULL, AV_LOG_ERROR, "Could not create output context\n");
+        log_err("avformat_alloc_output_context2 failed");
         return AVERROR_UNKNOWN;
     }
 
     for (i = 0; i < ifmt_ctx->nb_streams; i++) {
         out_stream = avformat_new_stream(ofmt_ctx, NULL);
         if (!out_stream) {
-            av_log(NULL, AV_LOG_ERROR, "Failed allocating output stream\n");
+            log_err("avformat_new_stream failed\n");
             return AVERROR_UNKNOWN;
         }
 
@@ -101,12 +108,13 @@ int ff_open_output_file(const char *filename, TranscodeContext *transcode_contex
             /* in this example, we choose transcoding to same codec */
             encoder = avcodec_find_encoder(dec_ctx->codec_id);
             if (!encoder) {
-                av_log(NULL, AV_LOG_FATAL, "Necessary encoder not found %d %d\n", dec_ctx->codec_id, AV_CODEC_ID_HEVC);
+                log_err("avcodec_find_encoder failed, codec(%s)\n", avcodec_get_name(dec_ctx->codec_id));
                 return AVERROR_INVALIDDATA;
             }
+
             enc_ctx = avcodec_alloc_context3(encoder);
             if (!enc_ctx) {
-                av_log(NULL, AV_LOG_FATAL, "Failed to allocate the encoder context\n");
+                log_err("avcodec_alloc_context3 encoder failed\n");
                 return AVERROR(ENOMEM);
             }
 
@@ -140,37 +148,39 @@ int ff_open_output_file(const char *filename, TranscodeContext *transcode_contex
             /* Third parameter can be used to pass settings to encoder */
             ret = avcodec_open2(enc_ctx, encoder, NULL);
             if (ret < 0) {
-                av_log(NULL, AV_LOG_ERROR, "Cannot open video encoder for stream #%u\n", i);
+                log_err("avcodec_open2 stream #%u failed, error(%s)\n", i, av_err2str(ret));
                 return ret;
             }
+
             ret = avcodec_parameters_from_context(out_stream->codecpar, enc_ctx);
             if (ret < 0) {
-                av_log(NULL, AV_LOG_ERROR, "Failed to copy encoder parameters to output stream #%u\n", i);
+                log_err("avcodec_parameters_from_context stream #%u failed, error(%s)\n", i, av_err2str(ret));
                 return ret;
             }
 
             out_stream->time_base = enc_ctx->time_base;
             stream_ctx[i].enc_ctx = enc_ctx;
         } else if (dec_ctx->codec_type == AVMEDIA_TYPE_UNKNOWN) {
-            av_log(NULL, AV_LOG_FATAL, "Elementary stream #%d is of unknown type, cannot proceed\n", i);
+            log_err("unknown type of stream #%d\n", i);
             return AVERROR_INVALIDDATA;
         } else {
             /* if this stream must be remuxed */
             ret = avcodec_parameters_copy(out_stream->codecpar, in_stream->codecpar);
             if (ret < 0) {
-                av_log(NULL, AV_LOG_ERROR, "Copying parameters for stream #%u failed\n", i);
+                log_err("avcodec_parameters_copy subtitle of stream #%u failed, error(%s)", i, av_err2str(ret));
                 return ret;
             }
+
             out_stream->time_base = in_stream->time_base;
         }
-
     }
+
     av_dump_format(ofmt_ctx, 0, filename, 1);
 
     if (!(ofmt_ctx->oformat->flags & AVFMT_NOFILE)) {
         ret = avio_open(&ofmt_ctx->pb, filename, AVIO_FLAG_WRITE);
         if (ret < 0) {
-            av_log(NULL, AV_LOG_ERROR, "Could not open output file '%s'", filename);
+            log_err("avio_open failed, file(%s)", filename);
             return ret;
         }
     }
@@ -178,7 +188,7 @@ int ff_open_output_file(const char *filename, TranscodeContext *transcode_contex
     /* init muxer, write output file header */
     ret = avformat_write_header(ofmt_ctx, NULL);
     if (ret < 0) {
-        av_log(NULL, AV_LOG_ERROR, "Error occurred when opening output file\n");
+        log_err("avformat_write_header failed, error(%s)", av_err2str(ret));
         return ret;
     }
 
@@ -186,4 +196,3 @@ int ff_open_output_file(const char *filename, TranscodeContext *transcode_contex
 
     return 0;
 }
-
