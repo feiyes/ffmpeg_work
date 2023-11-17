@@ -36,6 +36,8 @@
 
 #include <libavcodec/avcodec.h>
 
+#include "log.h"
+
 #define AUDIO_INBUF_SIZE 20480
 #define AUDIO_REFILL_THRESH 4096
 
@@ -77,7 +79,7 @@ static void decode(AVCodecContext *dec_ctx, AVPacket *pkt, AVFrame *frame,
     /* send the packet with the compressed data to the decoder */
     ret = avcodec_send_packet(dec_ctx, pkt);
     if (ret < 0) {
-        fprintf(stderr, "Error submitting the packet to the decoder\n");
+        log_err("avcodec_send_packet failed, packet_size = %d, error(%s)\n", pkt->size, av_err2str(ret));
         return;
     }
 
@@ -87,15 +89,17 @@ static void decode(AVCodecContext *dec_ctx, AVPacket *pkt, AVFrame *frame,
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
             return;
         else if (ret < 0) {
-            fprintf(stderr, "Error during decoding\n");
+            log_err("avcodec_receive_frame failed, error(%s)\n", av_err2str(ret));
             return;
         }
+
         data_size = av_get_bytes_per_sample(dec_ctx->sample_fmt);
         if (data_size < 0) {
             /* This should not occur, checking just for paranoia */
-            fprintf(stderr, "Failed to calculate data size\n");
+            log_err("av_get_bytes_per_sample failed\n");
             return;
         }
+
         for (i = 0; i < frame->nb_samples; i++)
             for (ch = 0; ch < dec_ctx->ch_layout.nb_channels; ch++)
                 fwrite(frame->data[ch] + data_size*i, 1, data_size, outfile);
@@ -118,60 +122,74 @@ int main(int argc, char **argv)
     enum AVSampleFormat sfmt;
     int n_channels = 0;
     const char *fmt;
+    enum AVCodecID audio_codec_id = AV_CODEC_ID_AAC;
 
     if (argc <= 2) {
-        fprintf(stderr, "Usage: %s <input file> <output file>\n", argv[0]);
+        log_err("Usage: %s <input file> <output file>\n", argv[0]);
         return 0;
     }
+
     filename    = argv[1];
     outfilename = argv[2];
 
-    pkt = av_packet_alloc();
+    if (strstr(filename, "aac") != NULL) {
+        audio_codec_id = AV_CODEC_ID_AAC;
+    } else if (strstr(filename, "mp3") != NULL) {
+        audio_codec_id = AV_CODEC_ID_MP3;
+    } else {
+        printf("default codec id:%d\n", audio_codec_id);
+    }
 
-    /* find the MPEG audio decoder */
-    codec = avcodec_find_decoder(AV_CODEC_ID_MP3);
+    pkt = av_packet_alloc();
+    if (!pkt) {
+        log_err("av_packet_alloc failed\n");
+        return 1;
+    }
+
+    codec = avcodec_find_decoder(audio_codec_id);
     if (!codec) {
-        fprintf(stderr, "Codec not found\n");
+        log_err("avcodec_find_decoder failed\n");
         return 1;
     }
 
     parser = av_parser_init(codec->id);
     if (!parser) {
-        fprintf(stderr, "Parser not found\n");
+        log_err("av_parser_init failed\n");
         return 1;
     }
 
     c = avcodec_alloc_context3(codec);
     if (!c) {
-        fprintf(stderr, "Could not allocate audio codec context\n");
+        log_err("Could not allocate audio codec context\n");
         return 1;
     }
 
-    /* open it */
-    if (avcodec_open2(c, codec, NULL) < 0) {
-        fprintf(stderr, "Could not open codec\n");
+    ret = avcodec_open2(c, codec, NULL);
+    if (ret < 0) {
+        log_err("avcodec_open2 failed, error(%s)", av_err2str(ret));
         return 1;
     }
 
     f = fopen(filename, "rb");
     if (!f) {
-        fprintf(stderr, "Could not open %s\n", filename);
+        log_err("fopen %s failed\n", filename);
         return 1;
     }
+
     outfile = fopen(outfilename, "wb");
     if (!outfile) {
+        log_err("fopen %s failed\n", outfilename);
         av_free(c);
         return 1;
     }
 
-    /* decode until eof */
     data      = inbuf;
     data_size = fread(inbuf, 1, AUDIO_INBUF_SIZE, f);
 
     while (data_size > 0) {
         if (!decoded_frame) {
             if (!(decoded_frame = av_frame_alloc())) {
-                fprintf(stderr, "Could not allocate audio frame\n");
+                log_err("could not allocate audio frame\n");
                 return 1;
             }
         }
@@ -180,7 +198,7 @@ int main(int argc, char **argv)
                                data, data_size,
                                AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
         if (ret < 0) {
-            fprintf(stderr, "Error while parsing\n");
+            log_err("av_parser_parse2 failed, error(%s)\n", av_err2str(ret));
             return 1;
         }
         data      += ret;
@@ -199,12 +217,10 @@ int main(int argc, char **argv)
         }
     }
 
-    /* flush the decoder */
     pkt->data = NULL;
     pkt->size = 0;
     decode(c, pkt, decoded_frame, outfile);
 
-    /* print output pcm infomations, because there have no metadata of pcm */
     sfmt = c->sample_fmt;
 
     if (av_sample_fmt_is_planar(sfmt)) {
