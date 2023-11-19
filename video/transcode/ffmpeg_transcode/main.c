@@ -8,8 +8,7 @@
 
 #define MAX_GETOPT_OPTIONS 100
 
-struct OptionExt
-{
+struct OptionExt {
     const char *name;
     int has_arg;
     int *flag;
@@ -23,8 +22,6 @@ typedef struct ConfigParam {
     char acodec_name[16];
     char vcodec_name[16];
 } ConfigParam;
-
-TranscodeContext transcode_context;
 
 static void Help(struct OptionExt *opt, const char *programName)
 {
@@ -49,8 +46,12 @@ static bool parse_arguments(int argc, char **argv, ConfigParam *cfg)
 
     struct option options[MAX_GETOPT_OPTIONS];
     struct OptionExt options_help[MAX_GETOPT_OPTIONS] = {
-        {"c:a",                   1, NULL, 0, "--acodec                    audio codec\n"},
-        {"c:v",                   1, NULL, 0, "--vcodec                    video codec\n"},
+        {"an",                    1, NULL, 0, "--an                        disable audio\n"},
+        {"vn",                    1, NULL, 0, "--vn                        disable video\n"},
+        {"c:a",                   1, NULL, 0, "--c:a                       force audio codec\n"},
+        {"c:v",                   1, NULL, 0, "--c:v                       force video codec\n"},
+        {"acodec",                1, NULL, 0, "--acodec                    force audio codec('copy' to copy stream)\n"},
+        {"vcodec",                1, NULL, 0, "--vcodec                    force video codec('copy' to copy stream)\n"},
         {NULL,                    0, NULL, 0},
     };
 
@@ -74,6 +75,14 @@ static bool parse_arguments(int argc, char **argv, ConfigParam *cfg)
                 memcpy(cfg->acodec_name, optarg, strlen(optarg));
             } else if (!strcmp(options[index].name, "c:v")) {
                 memcpy(cfg->vcodec_name, optarg, strlen(optarg));
+            } else if (!strcmp(options[index].name, "acodec")) {
+                memcpy(cfg->acodec_name, optarg, strlen(optarg));
+            } else if (!strcmp(options[index].name, "vcodec")) {
+                memcpy(cfg->vcodec_name, optarg, strlen(optarg));
+            } else if (!strcmp(options[index].name, "an")) {
+                memset(cfg->acodec_name, '\0', strlen(cfg->acodec_name));
+            } else if (!strcmp(options[index].name, "vn")) {
+                memset(cfg->vcodec_name, '\0', strlen(cfg->vcodec_name));
             } else {
                 Help(options_help, argv[0]);
                 return false;
@@ -96,6 +105,7 @@ int main(int argc, char **argv)
     AVPacket *packet = NULL;
     unsigned int stream_index;
     ConfigParam cfg = {0};
+    TranscodeContext context = {0};
 
     ret = parse_arguments(argc, argv, &cfg);
     if (ret == false) return -1;
@@ -103,30 +113,30 @@ int main(int argc, char **argv)
     //av_log_set_level(AV_LOG_INFO);
 
     if (strcmp(cfg.acodec_name, ""))
-        memcpy(transcode_context.acodec_name, cfg.acodec_name, strlen(cfg.acodec_name));
+        memcpy(context.acodec_name, cfg.acodec_name, strlen(cfg.acodec_name));
 
     if (strcmp(cfg.vcodec_name, ""))
-        memcpy(transcode_context.vcodec_name, cfg.vcodec_name, strlen(cfg.vcodec_name));
+        memcpy(context.vcodec_name, cfg.vcodec_name, strlen(cfg.vcodec_name));
 
-    log_info("ff_open_input_file, stream(%s->%s), codec(%s %s)\n",
+    log_info("open_input_file, stream(%s->%s), codec(%s %s)\n",
               cfg.in_file, cfg.out_file, cfg.acodec_name, cfg.vcodec_name);
-    ret = ff_open_input_file(cfg.in_file, &transcode_context);
+    ret = ff_open_input_file(cfg.in_file, &context);
     if (ret < 0) {
-        log_err("ff_open_input_file failed");
+        log_err("open_input_file failed");
         goto end;
     }
 
-    log_info("ff_open_output_file\n");
-    ret = ff_open_output_file(cfg.out_file, &transcode_context);
+    log_info("open_output_file\n");
+    ret = ff_open_output_file(cfg.out_file, &context);
     if (ret < 0) {
-        log_err("ff_open_output_file failed");
+        log_err("open_output_file failed");
         goto end;
     }
 
-    log_info("ff_init_filters\n");
-    ret = ff_init_filters(&transcode_context);
+    log_info("init_filters\n");
+    ret = ff_init_filters(&context);
     if (ret < 0) {
-        log_err("ff_init_filters failed");
+        log_err("init_filters failed");
         goto end;
     }
 
@@ -137,8 +147,13 @@ int main(int argc, char **argv)
         goto end;
     }
 
+    AVFormatContext *ifmt_ctx    = context.ifmt_ctx;
+    AVFormatContext *ofmt_ctx    = context.ofmt_ctx;
+    StreamContext *stream_ctx    = context.stream_ctx;
+    FilteringContext *filter_ctx = context.filter_ctx;
+
     while (1) {
-        ret = av_read_frame(transcode_context.ifmt_ctx, packet);
+        ret = av_read_frame(ifmt_ctx, packet);
         if (ret < 0) {
             log_err("av_read_frame failed, error(%s)", av_err2str(ret));
             break;
@@ -148,13 +163,13 @@ int main(int argc, char **argv)
         av_log(NULL, AV_LOG_INFO, "Demuxer gave frame of stream_index %u\n",
                 stream_index);
 
-        if (transcode_context.filter_ctx[stream_index].filter_graph) {
-            StreamContext *stream = &transcode_context.stream_ctx[stream_index];
+        if (filter_ctx[stream_index].filter_graph) {
+            StreamContext *stream = &stream_ctx[stream_index];
 
             av_log(NULL, AV_LOG_INFO, "Going to reencode&filter the frame\n");
 
             av_packet_rescale_ts(packet,
-                                 transcode_context.ifmt_ctx->streams[stream_index]->time_base,
+                                 ifmt_ctx->streams[stream_index]->time_base,
                                  stream->dec_ctx->time_base);
             ret = avcodec_send_packet(stream->dec_ctx, packet);
             if (ret < 0) {
@@ -172,17 +187,17 @@ int main(int argc, char **argv)
                 }
 
                 stream->dec_frame->pts = stream->dec_frame->best_effort_timestamp;
-                ret = ff_filter_encode_write_frame(stream->dec_frame, stream_index, &transcode_context);
+                ret = ff_filter_encode_write_frame(stream->dec_frame, stream_index, &context);
                 if (ret < 0)
                     goto end;
             }
         } else {
             /* remux this frame without reencoding */
             av_packet_rescale_ts(packet,
-                                 transcode_context.ifmt_ctx->streams[stream_index]->time_base,
-                                 transcode_context.ofmt_ctx->streams[stream_index]->time_base);
+                                 ifmt_ctx->streams[stream_index]->time_base,
+                                 ofmt_ctx->streams[stream_index]->time_base);
 
-            ret = av_interleaved_write_frame(transcode_context.ofmt_ctx, packet);
+            ret = av_interleaved_write_frame(ofmt_ctx, packet);
             if (ret < 0) {
                 log_err("av_interleaved_write_frame failed, error(%s)\n", av_err2str(ret));
                 goto end;
@@ -192,50 +207,50 @@ int main(int argc, char **argv)
     }
 
     /* flush filters and encoders */
-    for (i = 0; i < transcode_context.ifmt_ctx->nb_streams; i++) {
-        if (!transcode_context.filter_ctx[i].filter_graph)
+    for (i = 0; i < ifmt_ctx->nb_streams; i++) {
+        if (!filter_ctx[i].filter_graph)
             continue;
 
-        ret = ff_filter_encode_write_frame(NULL, i, &transcode_context);
+        ret = ff_filter_encode_write_frame(NULL, i, &context);
         if (ret < 0) {
             log_err("flushing filter failed\n");
             goto end;
         }
 
-        ret = ff_flush_encoder(i, &transcode_context);
+        ret = ff_flush_encoder(i, &context);
         if (ret < 0) {
             log_err("flushing encoder failed\n");
             goto end;
         }
     }
 
-    av_write_trailer(transcode_context.ofmt_ctx);
+    av_write_trailer(ofmt_ctx);
 end:
     av_packet_free(&packet);
 
-    for (i = 0; i < transcode_context.ifmt_ctx->nb_streams; i++) {
-        avcodec_free_context(&transcode_context.stream_ctx[i].dec_ctx);
+    for (i = 0; i < ifmt_ctx->nb_streams; i++) {
+        avcodec_free_context(&stream_ctx[i].dec_ctx);
 
-        if (transcode_context.ofmt_ctx && transcode_context.ofmt_ctx->nb_streams > i && transcode_context.ofmt_ctx->streams[i] && transcode_context.stream_ctx[i].enc_ctx)
-            avcodec_free_context(&transcode_context.stream_ctx[i].enc_ctx);
+        if (ofmt_ctx && ofmt_ctx->nb_streams > i && ofmt_ctx->streams[i] && stream_ctx[i].enc_ctx)
+            avcodec_free_context(&stream_ctx[i].enc_ctx);
 
-        if (transcode_context.filter_ctx && transcode_context.filter_ctx[i].filter_graph) {
-            avfilter_graph_free(&transcode_context.filter_ctx[i].filter_graph);
-            av_packet_free(&transcode_context.filter_ctx[i].enc_pkt);
-            av_frame_free(&transcode_context.filter_ctx[i].filtered_frame);
+        if (filter_ctx && filter_ctx[i].filter_graph) {
+            avfilter_graph_free(&filter_ctx[i].filter_graph);
+            av_packet_free(&filter_ctx[i].enc_pkt);
+            av_frame_free(&filter_ctx[i].filtered_frame);
         }
 
-        av_frame_free(&transcode_context.stream_ctx[i].dec_frame);
+        av_frame_free(&stream_ctx[i].dec_frame);
     }
 
-    av_free(transcode_context.filter_ctx);
-    av_free(transcode_context.stream_ctx);
-    avformat_close_input(&transcode_context.ifmt_ctx);
+    av_free(filter_ctx);
+    av_free(stream_ctx);
+    avformat_close_input(&ifmt_ctx);
 
-    if (transcode_context.ofmt_ctx && !(transcode_context.ofmt_ctx->oformat->flags & AVFMT_NOFILE))
-        avio_closep(&transcode_context.ofmt_ctx->pb);
+    if (ofmt_ctx && !(ofmt_ctx->oformat->flags & AVFMT_NOFILE))
+        avio_closep(&ofmt_ctx->pb);
 
-    avformat_free_context(transcode_context.ofmt_ctx);
+    avformat_free_context(ofmt_ctx);
 
     if (ret < 0)
         log_err("transcode failed\n");
