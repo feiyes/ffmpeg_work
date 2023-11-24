@@ -6,13 +6,13 @@
 
 #include "log.h"
 
-//#define AacHeader
+#define AacHeader
 
 #define OUTPUT_CHANNELS 2
 #define OUTPUT_BIT_RATE 96000
 #define OUTPUT_SAMPLE_RATE 48000
 
-const char* fileName = "../../../stream/video/war3end.mp4";
+const char* fileName = "../../../stream/video/mp4/war3end.mp4";
 #ifdef AacHeader
 const char* outFileName = "out.aac";
 #else
@@ -158,13 +158,11 @@ AVFormatContext * alloc_mp4_context()
 
 int main()
 {
-    int len = -1;
     int ret = -1;
     FILE *fp = NULL;
     int audio_index = -1;
     AVPacket* packet = NULL;
     AVFormatContext *ctx = NULL;
-    AVFormatContext *o_ctx = NULL;
 
     //av_log_set_level(AV_LOG_DEBUG);
 
@@ -204,7 +202,7 @@ int main()
     }
 
 #ifndef AacHeader
-    o_ctx = alloc_mp4_context();
+    AVFormatContext* o_ctx = alloc_mp4_context();
     if (!o_ctx) {
         goto failed;
     }
@@ -220,6 +218,7 @@ int main()
     while (av_read_frame(ctx, packet) >= 0) {
          if (packet->stream_index == audio_index) {
 #ifdef AacHeader
+            int len = -1;
             char adts_header_buf[7] = {0};
             add_adts_header(adts_header_buf, packet->size,
                             ctx->streams[audio_index]->codecpar->profile,
