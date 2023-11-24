@@ -3,8 +3,58 @@
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libswscale/swscale.h>
+#include <SDL2/SDL.h>
+#include <libavutil/imgutils.h>
+#ifdef __cplusplus
+};
+#endif
+
 #include "log.h"
 
+AVFrame* sws_frame = NULL;
+struct SwsContext *img_convert_ctx;
+// #define DUMP_AUDIO 1
+// #define DUMP_VIDEO 1
+#define OUT_FILE "out"
+#define REFRESH_EVENT  (SDL_USEREVENT + 1)
+#define BREAK_EVENT    (SDL_USEREVENT + 2)
+
+typedef struct {
+    FILE* fp_aout;
+    FILE* fp_vout;
+    SDL_Rect rect;
+    SDL_Window*   screen;
+    SDL_Texture*  texture;
+    SDL_Renderer* renderer;
+} ff_render_info;
+
+int thread_exit = 0;
+
+int refresh_video(void *opaque)
+{
+    SDL_Event event;
+
+    while (!thread_exit) {
+        event.type = REFRESH_EVENT;
+        SDL_PushEvent(&event);
+        SDL_Delay(40);
+    }
+
+    thread_exit = 0;
+    event.type = BREAK_EVENT;
+    SDL_PushEvent(&event);
+
+    return 0;
+}
+
+#ifdef DUMP_VIDEO
 /**
  * save yuv420p frame [YUV]
  */
@@ -131,8 +181,26 @@ void rgb24_save(FILE* fp, AVFrame *frame, AVCodecContext *codec_ctx)
 
     fflush(fp);
 }
+#endif
 
-static void decode_process(AVCodecContext* codec_ctx, AVFrame* frame, AVPacket* packet, FILE* fp, enum AVMediaType type)
+void render_video(SDL_Renderer* renderer, SDL_Texture* texture, SDL_Rect* rect, AVFrame *frame)
+{
+    //sws_scale(img_convert_ctx, (const unsigned char* const*)sws_frame->data, sws_frame->linesize,
+    //          0, codec_ctx->height, sws_frame->data, sws_frame->linesize);
+
+    SDL_UpdateYUVTexture(texture, rect,
+                         frame->data[0], frame->linesize[0],
+                         frame->data[1], frame->linesize[1],
+                         frame->data[2], frame->linesize[2]);
+
+    SDL_RenderClear(renderer);
+    SDL_RenderCopy(renderer, texture, NULL, rect);
+    SDL_RenderPresent(renderer);
+
+    SDL_Delay(40);
+}
+
+static void decode_process(AVCodecContext* codec_ctx, AVFrame* frame, AVPacket* packet, ff_render_info* render, enum AVMediaType type)
 {
     int ret = -1;
 
@@ -152,28 +220,32 @@ static void decode_process(AVCodecContext* codec_ctx, AVFrame* frame, AVPacket* 
         }
 
         if (type == AVMEDIA_TYPE_VIDEO) {
-            log_info("receive video frame %d", codec_ctx->frame_number);
+            log_info("receive video frame %d %d", codec_ctx->frame_number, frame->linesize[0]);
 
+#ifdef DUMP_VIDEO
             switch (frame->format) {
                 case AV_PIX_FMT_YUV420P:
                 case AV_PIX_FMT_YUVJ420P:
-                    yuv420p_save(fp, frame, codec_ctx);
+                    yuv420p_save(render->fp, frame, codec_ctx);
                     break;
                 case AV_PIX_FMT_RGB24:
-                    rgb24_save(fp, frame, codec_ctx);
+                    rgb24_save(render->fp, frame, codec_ctx);
                     break;
                 case AV_PIX_FMT_YUV422P:
                 case AV_PIX_FMT_YUVJ422P:
-                    yuv422p_save(fp, frame, codec_ctx);
+                    yuv422p_save(render->fp, frame, codec_ctx);
                     break;
                 case AV_PIX_FMT_YUV444P:
                 case AV_PIX_FMT_YUVJ444P:
-                    yuv444p_save(fp, frame, codec_ctx);
+                    yuv444p_save(render->fp, frame, codec_ctx);
                     break;
-                default :
+                default:
                     log_err("unsupport YUV format %d\n", frame->format);
                     break;
             }
+#else
+            render_video(render->renderer, render->texture, &render->rect, frame);
+#endif
         } else if (type == AVMEDIA_TYPE_AUDIO) {
             log_info("receive audio frame %d", codec_ctx->frame_number);
 
@@ -183,70 +255,56 @@ static void decode_process(AVCodecContext* codec_ctx, AVFrame* frame, AVPacket* 
                 return;
             }
 
+#ifdef DUMP_AUDIO
             for (int i = 0; i < frame->nb_samples; i++) {
                 for (int ch = 0; ch < codec_ctx->ch_layout.nb_channels; ch++) {
-                    fwrite(frame->data[ch] + data_size * i, 1, data_size, fp);
+                    fwrite(frame->data[ch] + data_size * i, 1, data_size, render->fp);
                 }
             }
+#endif
         }
     }
 }
 
-static struct option long_options[] = {
-    {"input",         required_argument, NULL, 'i'},
-    {"output",        required_argument, NULL, 'o'},
-    {NULL,            0,                 NULL,   0}
-};
-
 int main(int argc, char* argv[])
 {
-    int c = 0;
     int ret = -1;
     int video_index = -1;
     int audio_index = -1;
-    FILE* fp_vout = NULL;
-    FILE* fp_aout = NULL;
     AVFrame* frame = NULL;
     AVPacket* packet = NULL;
-    char out_file[64] = {'\0'};
-    char audio_file[80] = {'\0'};
-    char video_file[80] = {'\0'};
-    char stream_file[80] = {'\0'};
+    char* stream_file = NULL;
+    ff_render_info render = {0};
     AVFormatContext* fmt_ctx = NULL;
     AVCodecContext* video_ctx = NULL;
     AVCodecContext* audio_ctx = NULL;
 
-    while ((c = getopt_long(argc, argv, ":i:o:a", long_options, NULL)) != -1) {
-        switch (c) {
-        case 'i':
-            strncpy(stream_file, optarg, strlen(optarg));
-            break;
-        case 'o':
-            strncpy(out_file, optarg, strlen(optarg));
-            break;
-        default:
-            return -1;
-        }
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <input file>\n", argv[0]);
+        return 0;
     }
 
-    if (strcmp(stream_file, "\0") == 0 || strcmp(out_file, "\0") == 0) {
-        log_err("invalid stream %s or out file %s\n", stream_file, out_file);
-        return -1;
-    }
+    stream_file = argv[1];
 
-    sprintf(video_file, "%s.%s", out_file, "yuv");
-    fp_vout = fopen(video_file, "wb+");
-    if (!fp_vout) {
+#ifdef DUMP_VIDEO
+    char video_file[80] = {'\0'};
+    sprintf(video_file, "%s.%s", OUT_FILE, "yuv");
+    render.fp_vout = fopen(video_file, "wb+");
+    if (!render.fp_vout) {
         log_err("fopen %s failed\n", video_file);
         return -1;
     }
+#endif
 
-    sprintf(audio_file, "%s.%s", out_file, "pcm");
-    fp_aout = fopen(audio_file, "wb+");
-    if (!fp_aout) {
+#ifdef DUMP_AUDIO
+    char audio_file[80] = {'\0'};
+    sprintf(audio_file, "%s.%s", OUT_FILE, "pcm");
+    render.fp_aout = fopen(audio_file, "wb+");
+    if (!render.fp_aout) {
         log_err("fopen %s failed\n", audio_file);
         return -1;
     }
+#endif
 
     ret = avformat_open_input(&fmt_ctx, stream_file, NULL, NULL);
     if (ret < 0) {
@@ -321,27 +379,87 @@ int main(int argc, char* argv[])
         return -1;
     }
 
-    while (av_read_frame(fmt_ctx, packet) >= 0) {
-        if (packet->stream_index == video_index) {
-            decode_process(video_ctx, frame, packet, fp_vout, AVMEDIA_TYPE_VIDEO);
-        } else if (packet->stream_index == audio_index) {
-            decode_process(audio_ctx, frame, packet, fp_aout, AVMEDIA_TYPE_AUDIO);
-        }
+    av_dump_format(fmt_ctx, 0, stream_file, 0);
 
-        av_packet_unref(packet);
+    SDL_Event event;
+    render.rect.x = 0;
+    render.rect.y = 0;
+    render.rect.w = video_ctx->width;
+    render.rect.h = video_ctx->height;
+    int screen_w = video_ctx->width;
+    int screen_h = video_ctx->height;
+    render.screen = SDL_CreateWindow("ffmpeg player Window", SDL_WINDOWPOS_UNDEFINED,
+                                     SDL_WINDOWPOS_UNDEFINED, screen_w, screen_h, SDL_WINDOW_OPENGL);
+    if (!render.screen) {
+        printf("SDL: could not create window - exiting:%s\n",SDL_GetError());
+        return -1;
     }
 
-    if (video_ctx) decode_process(video_ctx, frame, NULL, fp_vout, AVMEDIA_TYPE_VIDEO);
-    if (audio_ctx) decode_process(audio_ctx, frame, NULL, fp_aout, AVMEDIA_TYPE_AUDIO);
+    SDL_Thread *refresh_thread = SDL_CreateThread(refresh_video, NULL, NULL);
+
+    render.renderer = SDL_CreateRenderer(render.screen, -1, 0);
+    render.texture  = SDL_CreateTexture(render.renderer, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING,
+                                        video_ctx->width, video_ctx->height);
+
+    sws_frame = av_frame_alloc();
+    if (!sws_frame) {
+        fprintf(stderr, "Could not allocate video frame\n");
+        return -1;
+    }
+
+    sws_frame->format = video_ctx->pix_fmt;
+    sws_frame->width  = video_ctx->width;
+    sws_frame->height = video_ctx->height;
+
+    ret = av_frame_get_buffer(sws_frame, 0);
+    if (ret < 0) {
+        fprintf(stderr, "Could not allocate the video frame data\n");
+        return -1;
+    }
+
+    img_convert_ctx = sws_getContext(video_ctx->width, video_ctx->height, video_ctx->pix_fmt,
+    video_ctx->width, video_ctx->height, AV_PIX_FMT_YUV420P, SWS_BICUBIC, NULL, NULL, NULL);
+
+    for (;;) {
+        SDL_WaitEvent(&event);
+
+        if (event.type == REFRESH_EVENT) {
+            ret = av_read_frame(fmt_ctx, packet);
+            if (ret >= 0) {
+                if (packet->stream_index == video_index) {
+                    decode_process(video_ctx, frame, packet, &render, AVMEDIA_TYPE_VIDEO);
+                } else if (packet->stream_index == audio_index) {
+                    decode_process(audio_ctx, frame, packet, &render, AVMEDIA_TYPE_AUDIO);
+                }
+
+                av_packet_unref(packet);
+            } else {
+                if (video_ctx) decode_process(video_ctx, frame, NULL, &render, AVMEDIA_TYPE_VIDEO);
+                if (audio_ctx) decode_process(audio_ctx, frame, NULL, &render, AVMEDIA_TYPE_AUDIO);
+            }
+        } else if (event.type == SDL_WINDOWEVENT) {
+            SDL_GetWindowSize(render.screen, &screen_w, &screen_h);
+        } else if (event.type == SDL_QUIT) {
+            thread_exit = 1;
+        } else if (event.type == BREAK_EVENT) {
+            break;
+        }
+    }
 
     log_info("demuxing completed");
 
-    if (fp_vout) fclose(fp_vout);
-    if (fp_aout) fclose(fp_aout);
+#ifdef DUMP_VIDEO
+    if (render.fp_vout) fclose(render.fp_vout);
+#endif
+
+#ifdef DUMP_AUDIO
+    if (render.fp_aout) fclose(render.fp_aout);
+#endif
 
     if (video_ctx) avcodec_free_context(&video_ctx);
     if (audio_ctx) avcodec_free_context(&audio_ctx);
 
+    SDL_Quit();
     av_frame_free(&frame);
     av_packet_free(&packet);
 
