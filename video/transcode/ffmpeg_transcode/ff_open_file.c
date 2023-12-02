@@ -51,6 +51,9 @@ int ff_open_input_file(const char *filename, TranscodeContext *transcode_context
                 || codec_ctx->codec_type == AVMEDIA_TYPE_AUDIO) {
             if (codec_ctx->codec_type == AVMEDIA_TYPE_VIDEO)
                 codec_ctx->framerate = av_guess_frame_rate(ifmt_ctx, stream, NULL);
+            else if (codec_ctx->codec_type == AVMEDIA_TYPE_AUDIO)
+                codec_ctx->pkt_timebase = stream->time_base;
+
             /* Open decoder */
             ret = avcodec_open2(codec_ctx, dec, NULL);
             if (ret < 0) {
