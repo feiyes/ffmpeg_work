@@ -1,6 +1,8 @@
 #ifndef __AV_TRANSCODE_H__
 #define __AV_TRANSCODE_H__
 
+#include <stdbool.h>
+#include <libavcodec/bsf.h>
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavfilter/buffersrc.h>
@@ -23,8 +25,11 @@ typedef struct StreamContext {
 } StreamContext;
 
 typedef struct TransCodeContext {
+    bool copy_audio;
+    bool copy_video;
     char acodec_name[16];
     char vcodec_name[16];
+    AVBSFContext *bsf_ctx;
     AVFormatContext *ifmt_ctx;
     AVFormatContext *ofmt_ctx;
     StreamContext *stream_ctx;

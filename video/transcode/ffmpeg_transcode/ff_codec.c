@@ -9,7 +9,7 @@ int ff_encode_write_frame(unsigned int stream_index, int flush, StreamContext *s
     AVPacket *enc_pkt = filter->enc_pkt;
     int ret;
 
-    av_log(NULL, AV_LOG_INFO, "Encoding frame\n");
+    log_info("Encoding frame\n");
     /* encode filtered frame */
     av_packet_unref(enc_pkt);
 
@@ -37,21 +37,18 @@ int ff_encode_write_frame(unsigned int stream_index, int flush, StreamContext *s
         if (ret < 0) {
             log_err("av_interleaved_write_frame failed, error(%s)\n", av_err2str(ret));
         }
-
     }
 
     return ret;
 }
 
-
-int ff_flush_encoder(unsigned int stream_index, TranscodeContext *transcode_context)
+int ff_flush_encoder(unsigned int stream_index, TranscodeContext *context)
 {
-    StreamContext *stream_ctx = transcode_context->stream_ctx;
+    StreamContext *stream_ctx = context->stream_ctx;
 
-    if (!(stream_ctx[stream_index].enc_ctx->codec->capabilities &
-                AV_CODEC_CAP_DELAY))
+    if (!(stream_ctx[stream_index].enc_ctx->codec->capabilities & AV_CODEC_CAP_DELAY))
         return 0;
 
-    av_log(NULL, AV_LOG_INFO, "Flushing stream #%u encoder\n", stream_index);
-    return ff_encode_write_frame(stream_index, 1, stream_ctx, transcode_context->filter_ctx, transcode_context->ofmt_ctx);
+    log_info("Flushing stream #%u encoder", stream_index);
+    return ff_encode_write_frame(stream_index, 1, stream_ctx, context->filter_ctx, context->ofmt_ctx);
 }

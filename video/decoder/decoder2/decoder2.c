@@ -1,7 +1,8 @@
 #include <getopt.h>
 #include <libavutil/imgutils.h>
-#include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
+#include <libavutil/timestamp.h>
+#include <libavformat/avformat.h>
 
 #include "log.h"
 
@@ -152,7 +153,12 @@ static void decode_process(AVCodecContext* codec_ctx, AVFrame* frame, AVPacket* 
         }
 
         if (type == AVMEDIA_TYPE_VIDEO) {
-            log_info("receive video frame %d", codec_ctx->frame_number);
+            log_info("receive video frame %d, pts = %s dts = %s",
+                      codec_ctx->frame_number,
+                      av_ts2timestr(frame->pts, &codec_ctx->time_base),
+                      av_ts2timestr(frame->pkt_dts, &codec_ctx->time_base));
+
+            if (!fp) continue;
 
             switch (frame->format) {
                 case AV_PIX_FMT_YUV420P:
@@ -175,7 +181,11 @@ static void decode_process(AVCodecContext* codec_ctx, AVFrame* frame, AVPacket* 
                     break;
             }
         } else if (type == AVMEDIA_TYPE_AUDIO) {
-            log_info("receive audio frame %d", codec_ctx->frame_number);
+            log_info("receive audio frame %d, pts = %s",
+                      codec_ctx->frame_number,
+                      av_ts2timestr(frame->pts, &codec_ctx->time_base));
+
+            if (!fp) continue;
 
             int data_size = av_get_bytes_per_sample(codec_ctx->sample_fmt);
             if (data_size < 0) {
@@ -229,23 +239,25 @@ int main(int argc, char* argv[])
         }
     }
 
-    if (strcmp(stream_file, "\0") == 0 || strcmp(out_file, "\0") == 0) {
-        log_err("invalid stream %s or out file %s\n", stream_file, out_file);
+    if (strcmp(stream_file, "\0") == 0) {
+        log_err("invalid stream %s file\n", stream_file);
         return -1;
     }
 
-    sprintf(video_file, "%s.%s", out_file, "yuv");
-    fp_vout = fopen(video_file, "wb+");
-    if (!fp_vout) {
-        log_err("fopen %s failed\n", video_file);
-        return -1;
-    }
+    if (strcmp(out_file, "\0") == 0) {
+        sprintf(video_file, "%s.%s", out_file, "yuv");
+        fp_vout = fopen(video_file, "wb+");
+        if (!fp_vout) {
+            log_err("fopen %s failed\n", video_file);
+            return -1;
+        }
 
-    sprintf(audio_file, "%s.%s", out_file, "pcm");
-    fp_aout = fopen(audio_file, "wb+");
-    if (!fp_aout) {
-        log_err("fopen %s failed\n", audio_file);
-        return -1;
+        sprintf(audio_file, "%s.%s", out_file, "pcm");
+        fp_aout = fopen(audio_file, "wb+");
+        if (!fp_aout) {
+            log_err("fopen %s failed\n", audio_file);
+            return -1;
+        }
     }
 
     ret = avformat_open_input(&fmt_ctx, stream_file, NULL, NULL);
@@ -259,6 +271,8 @@ int main(int argc, char* argv[])
         log_err("avformat_find_stream_info %s failed, error(%s)", stream_file, av_err2str(ret));
         return -1;
     }
+
+    av_dump_format(fmt_ctx, 0, stream_file, 0);
 
     for (int i = 0; i < fmt_ctx->nb_streams; i++) {
         AVStream* stream = fmt_ctx->streams[i];
@@ -293,14 +307,16 @@ int main(int argc, char* argv[])
             return -1;
         }
 
+        codec_ctx->time_base = stream->time_base;
+
         if (codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
             audio_index = i;
             audio_ctx = codec_ctx;
-            log_info("video codec %s", avcodec_get_name(codecpar->codec_id));
+            log_info("audio codec %s", avcodec_get_name(codecpar->codec_id));
         } else if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
             video_index = i;
             video_ctx = codec_ctx;
-            log_info("audio codec %s", avcodec_get_name(codecpar->codec_id));
+            log_info("video codec %s, delay %d", avcodec_get_name(codecpar->codec_id), codecpar->video_delay);
         }
     }
 
@@ -323,8 +339,14 @@ int main(int argc, char* argv[])
 
     while (av_read_frame(fmt_ctx, packet) >= 0) {
         if (packet->stream_index == video_index) {
+            log_info("send video packet, pts = (%.2f %s) dts = %s",
+                      packet->pts * av_q2d(video_ctx->time_base),
+                      av_ts2timestr(packet->pts, &video_ctx->time_base),
+                      av_ts2timestr(packet->dts, &video_ctx->time_base));
             decode_process(video_ctx, frame, packet, fp_vout, AVMEDIA_TYPE_VIDEO);
         } else if (packet->stream_index == audio_index) {
+            log_info("send audio packet, pts = %s",
+                      av_ts2timestr(packet->pts, &audio_ctx->time_base));
             decode_process(audio_ctx, frame, packet, fp_aout, AVMEDIA_TYPE_AUDIO);
         }
 

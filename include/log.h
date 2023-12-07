@@ -10,16 +10,20 @@ extern "C" {
 #endif
 #endif /* end of __cplusplus */
 
+#define log_dbg(fmt,...) do { \
+    fprintf(stderr,"\033[0;34m[DEBUG][%s(%d)] "fmt"\033[0m\n", basename(__FILE__), __LINE__, ##__VA_ARGS__); \
+} while(0)
+
 #define log_info(fmt,...) do { \
-    fprintf(stderr,"[INFO][%s(%d)] "fmt"\n", basename(__FILE__), __LINE__, ##__VA_ARGS__); \
+    fprintf(stderr,"\033[0;32m[INFO][%s(%d)] "fmt"\033[0m\n", basename(__FILE__), __LINE__, ##__VA_ARGS__); \
 } while(0)
 
 #define log_warn(fmt,...) do { \
-    fprintf(stderr,"[WARN][%s(%d)] "fmt"\n", basename(__FILE__), __LINE__, ##__VA_ARGS__); \
+    fprintf(stderr,"\033[0;33m[WARN][%s(%d)] "fmt"\033[0;39m\n", basename(__FILE__), __LINE__, ##__VA_ARGS__); \
 } while(0)
 
 #define log_err(fmt, ...) do { \
-    fprintf(stderr,"[ERROR][%s(%d)] "fmt"\n", basename(__FILE__), __LINE__, ##__VA_ARGS__); \
+    fprintf(stderr,"\033[0;31m[ERROR][%s(%d)] "fmt"\033[0m\n", basename(__FILE__), __LINE__, ##__VA_ARGS__); \
 } while(0)
 
 #ifdef __cplusplus

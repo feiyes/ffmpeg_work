@@ -1,7 +1,7 @@
 #include "log.h"
 #include "ff_open_file.h"
 
-int ff_open_input_file(const char *filename, TranscodeContext *transcode_context)
+int ff_open_input_file(const char *filename, TranscodeContext *context)
 {
     int ret;
     unsigned int i;
@@ -69,15 +69,15 @@ int ff_open_input_file(const char *filename, TranscodeContext *transcode_context
             return AVERROR(ENOMEM);
     }
 
-    transcode_context->ifmt_ctx   = ifmt_ctx;
-    transcode_context->stream_ctx = stream_ctx;
+    context->ifmt_ctx   = ifmt_ctx;
+    context->stream_ctx = stream_ctx;
 
     av_dump_format(ifmt_ctx, 0, filename, 0);
 
     return 0;
 }
 
-int ff_open_output_file(const char *filename, TranscodeContext *transcode_context)
+int ff_open_output_file(const char *filename, TranscodeContext *context)
 {
     AVStream *out_stream;
     AVStream *in_stream;
@@ -87,8 +87,8 @@ int ff_open_output_file(const char *filename, TranscodeContext *transcode_contex
     unsigned int i;
 
     AVFormatContext *ofmt_ctx = NULL;
-    AVFormatContext *ifmt_ctx = transcode_context->ifmt_ctx;
-    StreamContext *stream_ctx = transcode_context->stream_ctx;
+    AVFormatContext *ifmt_ctx = context->ifmt_ctx;
+    StreamContext *stream_ctx = context->stream_ctx;
 
     avformat_alloc_output_context2(&ofmt_ctx, NULL, NULL, filename);
     if (!ofmt_ctx) {
@@ -97,14 +97,14 @@ int ff_open_output_file(const char *filename, TranscodeContext *transcode_contex
     }
 
     for (i = 0; i < ifmt_ctx->nb_streams; i++) {
+        in_stream = ifmt_ctx->streams[i];
+        dec_ctx = stream_ctx[i].dec_ctx;
+
         out_stream = avformat_new_stream(ofmt_ctx, NULL);
         if (!out_stream) {
             log_err("avformat_new_stream failed\n");
             return AVERROR_UNKNOWN;
         }
-
-        in_stream = ifmt_ctx->streams[i];
-        dec_ctx = stream_ctx[i].dec_ctx;
 
         if (dec_ctx->codec_type == AVMEDIA_TYPE_VIDEO
                 || dec_ctx->codec_type == AVMEDIA_TYPE_AUDIO) {
@@ -135,6 +135,33 @@ int ff_open_output_file(const char *filename, TranscodeContext *transcode_contex
                     enc_ctx->pix_fmt = dec_ctx->pix_fmt;
                 /* video time_base can be set to whatever is handy and supported by encoder */
                 enc_ctx->time_base = av_inv_q(dec_ctx->framerate);
+
+                if (context->copy_video) {
+                    const AVBitStreamFilter *filter = NULL;
+
+                    if (dec_ctx->codec_id == AV_CODEC_ID_H264)
+                        filter = av_bsf_get_by_name("h264_mp4toannexb");
+                    else if (dec_ctx->codec_id == AV_CODEC_ID_H265)
+                        filter = av_bsf_get_by_name("hevc_mp4toannexb");
+                    if (!filter) {
+                        log_err("av_bsf_get_by_name failed");
+                        return -1;
+                    }
+
+                    ret = av_bsf_alloc(filter, &context->bsf_ctx);
+                    if (ret) {
+                        log_err("av_bsf_alloc failed, error(%s)", av_err2str(ret));
+                        return -1;
+                    }
+
+                    avcodec_parameters_copy(context->bsf_ctx->par_in, in_stream->codecpar);
+
+                    ret = av_bsf_init(context->bsf_ctx);
+                    if (ret) {
+                        log_err("av_bsf_init failed, error(%s)", av_err2str(ret));
+                        return -1;
+                    }
+                }
             } else {
                 enc_ctx->sample_rate = dec_ctx->sample_rate;
                 ret = av_channel_layout_copy(&enc_ctx->ch_layout, &dec_ctx->ch_layout);
@@ -195,7 +222,7 @@ int ff_open_output_file(const char *filename, TranscodeContext *transcode_contex
         return ret;
     }
 
-    transcode_context->ofmt_ctx = ofmt_ctx;
+    context->ofmt_ctx = ofmt_ctx;
 
     return 0;
 }

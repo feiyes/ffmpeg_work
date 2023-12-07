@@ -164,15 +164,15 @@ end:
     return ret;
 }
 
-int ff_init_filters(TranscodeContext *transcode_context)
+int ff_init_filters(TranscodeContext *context)
 {
     const char *filter_spec;
     unsigned int i;
     int ret;
 
     FilteringContext *filter_ctx = NULL;
-    AVFormatContext *ifmt_ctx = transcode_context->ifmt_ctx;
-    StreamContext *stream_ctx = transcode_context->stream_ctx;
+    AVFormatContext *ifmt_ctx = context->ifmt_ctx;
+    StreamContext *stream_ctx = context->stream_ctx;
 
     filter_ctx = av_malloc_array(ifmt_ctx->nb_streams, sizeof(*filter_ctx));
     if (!filter_ctx)
@@ -185,7 +185,6 @@ int ff_init_filters(TranscodeContext *transcode_context)
         if (!(ifmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO
                 || ifmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO))
             continue;
-
 
         if (ifmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
             filter_spec = "null"; /* passthrough (dummy) filter for video */
@@ -205,18 +204,18 @@ int ff_init_filters(TranscodeContext *transcode_context)
             return AVERROR(ENOMEM);
     }
 
-    transcode_context->filter_ctx = filter_ctx;
+    context->filter_ctx = filter_ctx;
 
     return 0;
 }
 
-int ff_filter_encode_write_frame(AVFrame *frame, unsigned int stream_index, TranscodeContext *transcode_context)
+int ff_filter_encode_write_frame(AVFrame *frame, unsigned int stream_index, TranscodeContext *context)
 {
-    StreamContext *stream_ctx = transcode_context->stream_ctx;
-    FilteringContext *filter = &transcode_context->filter_ctx[stream_index];
+    StreamContext *stream_ctx = context->stream_ctx;
+    FilteringContext *filter = &context->filter_ctx[stream_index];
     int ret;
 
-    av_log(NULL, AV_LOG_INFO, "Pushing decoded frame to filters\n");
+    log_info("Pushing decoded frame to filters");
     /* push the decoded frame into the filtergraph */
     ret = av_buffersrc_add_frame_flags(filter->buffersrc_ctx,
             frame, 0);
@@ -227,7 +226,7 @@ int ff_filter_encode_write_frame(AVFrame *frame, unsigned int stream_index, Tran
 
     /* pull filtered frames from the filtergraph */
     while (1) {
-        av_log(NULL, AV_LOG_INFO, "Pulling filtered frame from filters\n");
+        log_info("Pulling filtered frame from filters");
         ret = av_buffersink_get_frame(filter->buffersink_ctx,
                                       filter->filtered_frame);
         if (ret < 0) {
@@ -241,7 +240,7 @@ int ff_filter_encode_write_frame(AVFrame *frame, unsigned int stream_index, Tran
         }
 
         filter->filtered_frame->pict_type = AV_PICTURE_TYPE_NONE;
-        ret = ff_encode_write_frame(stream_index, 0, stream_ctx, transcode_context->filter_ctx, transcode_context->ofmt_ctx);
+        ret = ff_encode_write_frame(stream_index, 0, stream_ctx, context->filter_ctx, context->ofmt_ctx);
         av_frame_unref(filter->filtered_frame);
         if (ret < 0)
             break;

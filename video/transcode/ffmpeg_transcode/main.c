@@ -75,22 +75,28 @@ static bool parse_arguments(int argc, char **argv, ConfigParam *cfg)
         case 0:
             if (!strcmp(options[index].name, "c:a")) {
                 cfg->copy_audio = true;
-                if (strcmp(optarg, "copy"))
+                if (!strcmp(optarg, "copy"))
                     memset(cfg->acodec_name, '\0', strlen(cfg->acodec_name));
                 else
                     memcpy(cfg->acodec_name, optarg, strlen(optarg));
             } else if (!strcmp(options[index].name, "c:v")) {
                 cfg->copy_video = true;
-                if (strcmp(optarg, "copy"))
+                if (!strcmp(optarg, "copy"))
                     memset(cfg->vcodec_name, '\0', strlen(cfg->vcodec_name));
                 else
                     memcpy(cfg->vcodec_name, optarg, strlen(optarg));
             } else if (!strcmp(options[index].name, "acodec")) {
                 cfg->copy_audio = true;
-                memcpy(cfg->acodec_name, optarg, strlen(optarg));
+                if (!strcmp(optarg, "copy"))
+                    memset(cfg->acodec_name, '\0', strlen(cfg->acodec_name));
+                else
+                    memcpy(cfg->acodec_name, optarg, strlen(optarg));
             } else if (!strcmp(options[index].name, "vcodec")) {
                 cfg->copy_video = true;
-                memcpy(cfg->vcodec_name, optarg, strlen(optarg));
+                if (!strcmp(optarg, "copy"))
+                    memset(cfg->vcodec_name, '\0', strlen(cfg->vcodec_name));
+                else
+                    memcpy(cfg->vcodec_name, optarg, strlen(optarg));
             } else if (!strcmp(options[index].name, "an")) {
                 cfg->copy_audio = false;
                 memset(cfg->acodec_name, '\0', strlen(cfg->acodec_name));
@@ -109,11 +115,22 @@ static bool parse_arguments(int argc, char **argv, ConfigParam *cfg)
         }
     }
 
+    if (strcmp(cfg->in_file, "") == 0 || strcmp(cfg->out_file, "") == 0) {
+        Help(options_help, argv[0]);
+        return false;
+    }
+
     return true;
 }
 
+// 1. support extract audio or video streams without changing codec type.
+// 2. support transcode audio stream to another codec type.
+// 3. support transcode video stream to another codec type.
+// 4. support transcode audio and video streams to different codec type.
+// 5. not support extract audio or video streams and then transcode to different codec type.
 int main(int argc, char **argv)
 {
+    int step = 0;
     int ret = -1;
     int64_t pts = 0;
     unsigned int i = 0;
@@ -131,14 +148,16 @@ int main(int argc, char **argv)
 
     //av_log_set_level(AV_LOG_INFO);
 
+    context.copy_audio = cfg.copy_audio;
+    context.copy_video = cfg.copy_video;
     if (strcmp(cfg.acodec_name, ""))
         memcpy(context.acodec_name, cfg.acodec_name, strlen(cfg.acodec_name));
 
     if (strcmp(cfg.vcodec_name, ""))
         memcpy(context.vcodec_name, cfg.vcodec_name, strlen(cfg.vcodec_name));
 
-    log_info("open_input_file, stream(%s->%s), codec(%s %s)\n",
-              cfg.in_file, cfg.out_file, cfg.acodec_name, cfg.vcodec_name);
+    log_dbg("Step %d: open_input_file, stream(%s->%s), codec(%s %s)\n",
+              step, cfg.in_file, cfg.out_file, cfg.acodec_name, cfg.vcodec_name);
     ret = ff_open_input_file(cfg.in_file, &context);
     ifmt_ctx   = context.ifmt_ctx;
     stream_ctx = context.stream_ctx;
@@ -147,7 +166,8 @@ int main(int argc, char **argv)
         goto end;
     }
 
-    log_info("open_output_file\n");
+    step++;
+    log_dbg("Step %d: open_output_file\n", step);
     ret = ff_open_output_file(cfg.out_file, &context);
     ofmt_ctx = context.ofmt_ctx;
     if (ret < 0) {
@@ -155,21 +175,28 @@ int main(int argc, char **argv)
         goto end;
     }
 
-    log_info("init_filters\n");
-    ret = ff_init_filters(&context);
-    filter_ctx = context.filter_ctx;
-    if (ret < 0) {
-        log_err("init_filters failed");
-        goto end;
+    if (strcmp(cfg.acodec_name, "") && strcmp(cfg.vcodec_name, "")) {
+        step++;
+        log_dbg("Step %d: init_filters\n", step);
+        ret = ff_init_filters(&context);
+        filter_ctx = context.filter_ctx;
+        if (ret < 0) {
+            log_err("init_filters failed");
+            goto end;
+        }
     }
 
-    log_info("av_packet_alloc\n");
+    step++;
+    log_dbg("Step %d: av_packet_alloc\n", step);
     packet = av_packet_alloc();
     if (!packet) {
         log_err("av_packet_alloc failed\n");
         goto end;
     }
 
+
+    step++;
+    log_dbg("Step %d: transcode start\n", step);
     while (1) {
         ret = av_read_frame(ifmt_ctx, packet);
         if (ret == AVERROR_EOF)
@@ -180,18 +207,19 @@ int main(int argc, char **argv)
         }
 
         stream_index = packet->stream_index;
-        av_log(NULL, AV_LOG_INFO, "Demuxer gave frame of stream_index %u\n",
-                stream_index);
 
         if (stream_ctx[stream_index].dec_ctx->codec_type == AVMEDIA_TYPE_VIDEO && !cfg.copy_video)
             continue;
         else if (stream_ctx[stream_index].dec_ctx->codec_type == AVMEDIA_TYPE_AUDIO && !cfg.copy_audio)
             continue;
 
-        if ((strcmp(cfg.acodec_name, "") == 0 || strcmp(cfg.vcodec_name, "")) && filter_ctx[stream_index].filter_graph) {
+        log_info("Demuxer gave %s frame of stream_index %u, size %d",
+                  av_get_media_type_string(stream_ctx[stream_index].dec_ctx->codec_type), stream_index, packet->size);
+
+        if (filter_ctx && filter_ctx[stream_index].filter_graph) {
             StreamContext *stream = &stream_ctx[stream_index];
 
-            av_log(NULL, AV_LOG_INFO, "Going to reencode&filter the frame\n");
+            log_info("Going to reencode&filter the frame");
 
             av_packet_rescale_ts(packet,
                                  ifmt_ctx->streams[stream_index]->time_base,
@@ -211,9 +239,13 @@ int main(int argc, char **argv)
                     goto end;
                 }
 
-                int frame_bytes = av_samples_get_buffer_size(NULL, stream->dec_frame->ch_layout.nb_channels,
-                                     stream->dec_frame->nb_samples, stream->dec_frame->format, 1);
-                log_info("%d %d %d %d", frame_bytes, stream->dec_frame->nb_samples, stream->dec_frame->format, stream->dec_frame->ch_layout.nb_channels);
+                if (stream_ctx[stream_index].dec_ctx->codec_type == AVMEDIA_TYPE_AUDIO) {
+                    int frame_bytes = av_samples_get_buffer_size(NULL, stream->dec_frame->ch_layout.nb_channels,
+                                         stream->dec_frame->nb_samples, stream->dec_frame->format, 1);
+                    log_info("%d %d %d %d", frame_bytes, stream->dec_frame->nb_samples,
+                                            stream->dec_frame->format, stream->dec_frame->ch_layout.nb_channels);
+                }
+
                 stream->dec_frame->pts = stream->dec_frame->best_effort_timestamp < 0 ? pts :
                                          stream->dec_frame->best_effort_timestamp;
                 ret = ff_filter_encode_write_frame(stream->dec_frame, stream_index, &context);
@@ -223,10 +255,26 @@ int main(int argc, char **argv)
                 pts++;
             }
         } else {
-            /* remux this frame without reencoding */
+            if (stream_ctx[stream_index].dec_ctx->codec_type == AVMEDIA_TYPE_VIDEO)
+                log_info("Extract Video frame");
+            else if (stream_ctx[stream_index].dec_ctx->codec_type == AVMEDIA_TYPE_AUDIO)
+                log_info("Extract Audio frame");
+            else
+                log_info("Extract frame");
+
             av_packet_rescale_ts(packet,
                                  ifmt_ctx->streams[stream_index]->time_base,
                                  ofmt_ctx->streams[stream_index]->time_base);
+
+            if (stream_ctx[stream_index].dec_ctx->codec_type == AVMEDIA_TYPE_VIDEO) {
+                av_bsf_send_packet(context.bsf_ctx, packet);
+
+                ret = av_bsf_receive_packet(context.bsf_ctx, packet);
+                if (ret) {
+                    log_err("av_bsf_receive_packet failed, error(%s)", av_err2str(ret));
+                    continue;
+                }
+            }
 
             ret = av_interleaved_write_frame(ofmt_ctx, packet);
             if (ret < 0) {
@@ -237,10 +285,12 @@ int main(int argc, char **argv)
         av_packet_unref(packet);
     }
 
-    /* flush filters and encoders */
     for (i = 0; i < ifmt_ctx->nb_streams; i++) {
-        if (!filter_ctx[i].filter_graph)
+        if (!filter_ctx || filter_ctx && !filter_ctx[i].filter_graph) {
+            if (ret == AVERROR_EOF) ret = 0;
+
             continue;
+        }
 
         ret = ff_filter_encode_write_frame(NULL, i, &context);
         if (ret < 0) {
@@ -255,6 +305,8 @@ int main(int argc, char **argv)
         }
     }
 
+    step++;
+    log_dbg("Step %d: av_write_trailer\n", step);
     av_write_trailer(ofmt_ctx);
 end:
     av_packet_free(&packet);
@@ -285,8 +337,11 @@ end:
 
     if (ofmt_ctx) avformat_free_context(ofmt_ctx);
 
+    step++;
     if (ret < 0)
         log_err("transcode failed\n");
+    else
+        log_dbg("Step %d: transcode completed\n", step);
 
     return ret ? 1 : 0;
 }
