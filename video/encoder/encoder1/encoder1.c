@@ -13,6 +13,9 @@
 
 #include "log.h"
 
+#define SEI_SIZE      1024
+#define USERDATA_SIZE 32
+
 static int send_frame_count = 0;
 static int get_frame_count  = 0;
 
@@ -114,8 +117,11 @@ int main(int argc, char **argv)
     int dst_h = 720;
     int need_size = -1;
     FILE *fp_in  = NULL;
+    char *user_data = NULL;
     AVFrame *enc_frame = NULL;
     AVFrame *sws_frame = NULL;
+    AVBufferRef *sei_buf = NULL;
+    AVFrameSideData *side_data = NULL;
     bool enable_filter = false;
     uint8_t *yuv_buf = NULL;
     int64_t start_time = -1;
@@ -230,7 +236,61 @@ int main(int argc, char **argv)
             return ret;
         }
 
-        ret = av_opt_set(ctx.codec_context->priv_data, "profile", "main", 0);
+        ret = av_opt_set(ctx.codec_context->priv_data, "profile", "high", 0);
+        if (ret < 0) {
+            log_err("av_opt_set profile failed, error(%s)", av_err2str(ret));
+            return -1;
+        }
+
+        ret = av_opt_set(ctx.codec_context->priv_data, "level", "4", 0);
+        if (ret < 0) {
+            log_err("av_opt_set profile failed, error(%s)", av_err2str(ret));
+            return -1;
+        }
+
+        ret = av_opt_set(ctx.codec_context->priv_data, "qp", "10", 0);
+        if (ret < 0) {
+            log_err("av_opt_set profile failed, error(%s)", av_err2str(ret));
+            return -1;
+        }
+
+        ret = av_opt_set(ctx.codec_context->priv_data, "intra-refresh", "0", 0);
+        if (ret < 0) {
+            log_err("av_opt_set profile failed, error(%s)", av_err2str(ret));
+            return -1;
+        }
+
+        ret = av_opt_set(ctx.codec_context->priv_data, "aud", "0", 0);
+        if (ret < 0) {
+            log_err("av_opt_set profile failed, error(%s)", av_err2str(ret));
+            return -1;
+        }
+
+        ret = av_opt_set(ctx.codec_context->priv_data, "udu_sei", "0", 0);
+        if (ret < 0) {
+            log_err("av_opt_set profile failed, error(%s)", av_err2str(ret));
+            return -1;
+        }
+
+        ret = av_opt_set(ctx.codec_context->priv_data, "fastfirstpass", "1", 0);
+        if (ret < 0) {
+            log_err("av_opt_set profile failed, error(%s)", av_err2str(ret));
+            return -1;
+        }
+
+        ret = av_opt_set(ctx.codec_context->priv_data, "weightp", "1", 0);
+        if (ret < 0) {
+            log_err("av_opt_set profile failed, error(%s)", av_err2str(ret));
+            return -1;
+        }
+
+        ret = av_opt_set(ctx.codec_context->priv_data, "a53cc", "0", 0);
+        if (ret < 0) {
+            log_err("av_opt_set profile failed, error(%s)", av_err2str(ret));
+            return -1;
+        }
+
+        ret = av_opt_set(ctx.codec_context->priv_data, "forced-idr", "0", 0);
         if (ret < 0) {
             log_err("av_opt_set profile failed, error(%s)", av_err2str(ret));
             return -1;
@@ -303,6 +363,12 @@ int main(int argc, char **argv)
         }
     }
 
+    user_data = av_malloc(USERDATA_SIZE);
+    if (!user_data) {
+        log_err("av_malloc failed\n");
+        return -1;
+    }
+
     AVPacket *packet = av_packet_alloc();
     if (!packet) {
         log_err("av_packet_alloc failed\n");
@@ -312,6 +378,21 @@ int main(int argc, char **argv)
     enc_frame = av_frame_alloc();
     if (!enc_frame) {
         log_err("av_frame_alloc failed\n");
+        return -1;
+    }
+
+    sei_buf = av_buffer_alloc(SEI_SIZE);
+    if (!sei_buf) {
+        log_err("av_buffer_alloc failed\n");
+        return -1;
+    }
+
+    memset(user_data, 0x0, USERDATA_SIZE);
+    sei_buf->data = (uint8_t*)user_data;
+    sei_buf->size = USERDATA_SIZE;
+    side_data = av_frame_new_side_data_from_buf(enc_frame, AV_FRAME_DATA_SEI_UNREGISTERED, sei_buf);
+    if (!side_data) {
+        log_err("av_frame_new_side_data_from_buf failed\n");
         return -1;
     }
 
@@ -395,6 +476,8 @@ int main(int argc, char **argv)
             }
         }
 
+        snprintf(user_data, USERDATA_SIZE, "Custom User Data %d", send_frame_count);
+
         enc_frame->pts = pts;
         start_frame_time = get_time_ms();
         ret = encode_process(&ctx, enc_frame, packet);
@@ -422,13 +505,18 @@ int main(int argc, char **argv)
     if (yuv_buf) free(yuv_buf);
     if (ctx.fp) fclose(ctx.fp);
     if (packet) av_packet_free(&packet);
-    if (enc_frame) av_frame_free(&enc_frame);
     if (enable_filter) av_frame_free(&sws_frame);
     if (ctx.codec_context) avcodec_free_context(&ctx.codec_context);
 
     if (ctx.codec->id == AV_CODEC_ID_MPEG4) {
         avio_close(ctx.format_context->pb);
         avformat_free_context(ctx.format_context);
+    }
+
+    if (user_data) av_free(user_data);
+    if (enc_frame) {
+        av_frame_remove_side_data(enc_frame, AV_FRAME_DATA_SEI_UNREGISTERED);
+        av_frame_free(&enc_frame);
     }
 
     log_info("encoder ended, press enter to exit");
