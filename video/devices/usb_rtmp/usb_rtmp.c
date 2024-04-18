@@ -1,558 +1,450 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <errno.h>
-#include <assert.h>
-#include <fcntl.h>
-#include <malloc.h>
-#include <math.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sys/poll.h>
-#include <linux/types.h>
-#include <linux/videodev2.h>
-#include <libavutil/time.h>
-#include <libavutil/imgutils.h>
-#include <libavutil/mathematics.h>
 #include <libavcodec/avcodec.h>
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
+#include <libavutil/timestamp.h>
 #include <libavformat/avformat.h>
 #include <libavdevice/avdevice.h>
 #include "log.h"
 
-#define MAX_CHANNEL     (4)
-#define AV_IO_BUF_SIZE  (96*1024)
-#define DEV_TYPE        "video4linux2"
-#define DEV_NAME        "/dev/video0"
+#define DO_SWS_SCALE  1
+#define DO_ENCODE     1
+//#define DUMP_DEC_YUV  1
+//#define DUMP_SWS_YUV  1
+#define ENC_WIDTH     320
+#define ENC_HEIGHT    240
 
-struct buffer {
-    void   *start;
-    size_t length;
-};
-
-struct usbcamera_node {
-    int fd;
-    char id[32];
-    int channel;
-    int usb_port;
-    int n_buffers;
-    char devname[32];
-    struct buffer *buffers;
-    struct v4l2_format fmt;
-    struct v4l2_streamparm parm;
-    struct v4l2_requestbuffers req;
-    int poll_index[MAX_CHANNEL];
-};
-
-unsigned int frame_len = 0;
-unsigned int frame_cnt = 0;
-struct usbcamera_node usbcamra;
-nfds_t usbcamra_poll_fd_num = 0;
-struct pollfd usbcamra_poll_fd[MAX_CHANNEL];
-
-static int xioctl(int fh, int request, void *arg)
+void list_device_cap()
 {
-    int r = -1;
+    const AVInputFormat* in_fmt = av_find_input_format("v4l2");
+    if (!in_fmt) {
+        log_err("av_find_input_format failed");
+        return;
+    }
 
-    do {
-        r = ioctl(fh, request, arg);
-    } while (-1 == r && EINTR == errno);
+    AVFormatContext* in_fmt_ctx = avformat_alloc_context();
+    if (!in_fmt_ctx) {
+        log_err("avformat_alloc_context failed");
+        return;
+    }
 
-    return r;
+    AVDictionary* opt = NULL;
+    av_dict_set(&opt, "list_formats", "3", 0);
+    avformat_open_input(&in_fmt_ctx, "/dev/video0", in_fmt, &opt);
+
+    av_dict_free(&opt);
+    avformat_free_context(in_fmt_ctx);
 }
 
-static int capture_init(struct usbcamera_node *camera_node)
+void sws_process(AVCodecContext* dec_ctx, struct SwsContext *sws_ctx,
+                 AVFrame* dec_frame, AVFrame* sws_frame, FILE* sws_fp)
 {
-    int ret = 0;
-    struct v4l2_capability cap;
-    struct v4l2_fmtdesc fmtdesc;
+    sws_frame->pts       = dec_frame->pts;
+    sws_frame->pkt_dts   = dec_frame->pkt_dts;
+    sws_frame->time_base = dec_frame->time_base;
+    sws_frame->duration  = dec_frame->duration;
+    sws_scale(sws_ctx, (const uint8_t* const*)dec_frame->data, dec_frame->linesize,
+              0, dec_ctx->height, sws_frame->data, sws_frame->linesize);
 
-    camera_node->fd = open(camera_node->devname, O_RDWR | O_NONBLOCK, 0);
-    if (-1 == camera_node->fd) {
-        log_err("open(%s) failed, error = %d(%s)\n", camera_node->devname, errno, strerror(errno));
-        return -1;
+#ifdef DUMP_SWS_YUV
+    int sws_y_size = sws_frame->width * sws_frame->height;
+    switch (sws_frame->format) {
+    case AV_PIX_FMT_YUV420P:
+    case AV_PIX_FMT_YUVJ420P:
+        fwrite(sws_frame->data[0], 1, sws_y_size,     sws_fp); // Y
+        fwrite(sws_frame->data[1], 1, sws_y_size / 4, sws_fp); // U
+        fwrite(sws_frame->data[2], 1, sws_y_size / 4, sws_fp); // V
+        break;
+    case AV_PIX_FMT_YUYV422:
+        fwrite(sws_frame->data[0], 1, sws_y_size * 2, sws_fp);
+        break;
+    default :
+        log_err("unsupport YUV format %d\n", sws_frame->format);
+        break;
+    }
+#endif
+}
+
+void encode_process(AVFormatContext *enc_fmt_ctx, AVCodecContext *enc_ctx, AVStream *enc_stream,
+                    AVStream *dec_stream, AVFrame* sws_frame, AVPacket* enc_packet)
+{
+    int ret = -1;
+
+    ret = avcodec_send_frame(enc_ctx, sws_frame);
+    if (ret < 0) {
+        //log_err("avcodec_send_frame failed, error(%s)\n", av_err2str(ret));
+        return;
     }
 
-    if (-1 == xioctl(camera_node->fd, VIDIOC_QUERYCAP, &cap)) {
-        log_err("%s is not v4l2 device\n", camera_node->devname);
-        return -1;
+    ret = avcodec_receive_packet(enc_ctx, enc_packet);
+    if (ret < 0) {
+        //log_err("avcodec_receive_packet failed, error(%s)\n", av_err2str(ret));
+        return;
     }
 
-    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
-        log_err("%s is not video capture device\n", camera_node->devname);
-        return -1;
+    av_packet_rescale_ts(enc_packet, dec_stream->time_base, enc_stream->time_base);
+
+    //log_info("receive video enc_packet, pts(%ss %ld)\n",
+    //          av_ts2timestr(enc_packet->pts, &enc_stream->time_base), enc_packet->pts);
+
+    enc_packet->pos = -1;
+    enc_packet->stream_index = enc_stream->index;
+    av_interleaved_write_frame(enc_fmt_ctx, enc_packet);
+
+    av_packet_unref(enc_packet);
+}
+
+void decode_process(AVCodecContext* dec_ctx, AVStream *dec_stream, struct SwsContext *sws_ctx, AVFormatContext *enc_fmt_ctx,
+                    AVCodecContext* enc_ctx, AVStream *enc_stream, AVPacket* dec_packet, AVFrame* dec_frame,
+                    AVFrame* sws_frame, AVPacket* enc_packet, FILE* dec_fp, FILE* sws_fp)
+{
+    int ret = -1;
+
+    ret = avcodec_send_packet(dec_ctx, dec_packet);
+    if (ret < 0) {
+        log_err("avcodec_send_packet failed, error(%s)\n", av_err2str(ret));
+        return;
     }
 
-    if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
-        log_err("%s does not support streaming i/o\n", camera_node->devname);
-        return -1;
-    }
-
-    printf("\nDriver Info:\n");
-    printf("\tDriver name    : %s\n", cap.driver);
-    printf("\tCard type      : %s\n", cap.card);
-    printf("\tBus info       : %s\n", cap.bus_info);
-    //printf("\tthe version is: %d\n", cap.version);
-    printf("\tCapabilities   : 0x%x\n", cap.capabilities);
-    printf("\tDevice Caps    : 0x%x\n\n", cap.device_caps);
-
-    printf("\nFormat Video Capture:\n");
-    fmtdesc.index = 0;
-    fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    while (ioctl(camera_node->fd, VIDIOC_ENUM_FMT, &fmtdesc) != -1) {
-        printf("\tWidth/Height : %s\n", cap.driver);
-        printf("\tPixel Format : %x (%s)\n", fmtdesc.pixelformat, fmtdesc.description);
-        printf("\tFlags : %d\n", fmtdesc.flags);
-
-        printf("VIsuccess! fmtdesc.index:%d, fmtdesc.type:%d, fmtdesc.flags:%d, "
-               "fmtdesc.description:%s, fmtdesc.pixelformat:%d\n",
-               fmtdesc.index, fmtdesc.type, fmtdesc.flags, fmtdesc.description, fmtdesc.pixelformat);
-        fmtdesc.index++;
-    }
-
-    if (-1 == xioctl(camera_node->fd, VIDIOC_S_FMT, &camera_node->fmt)) {
-        log_err("%s set format failed\n", camera_node->devname);
-        return -1;
-    }
-
-        printf("\tField : %s\n", cap.bus_info);
-        printf("\tBytes per Line : %s\n", cap.driver);
-        printf("\tSize Image : %d\n", camera_node->fmt.fmt.pix.sizeimage);
-        printf("\tColorspace : %d\n", camera_node->fmt.fmt.pix.colorspace);
-        printf("\tTransfer Function : %s\n", cap.driver);
-        printf("\tYCbCr/HSV Encoding : %s\n", cap.card);
-        printf("\tQuantization : %d\n", camera_node->fmt.fmt.pix.quantization);
-    printf("VIDIOC_S_FMT success! width:%d, height:%d, pixelformat:%x, field:%d, bytesperline:%d, "
-           "sizeimage:%d, colorspace:%d, priv:%d, flags:%x, ycbcr_enc:%d, quantization:%d, xfer_func:%d\n",
-           camera_node->fmt.fmt.pix.width, camera_node->fmt.fmt.pix.height, camera_node->fmt.fmt.pix.pixelformat,
-           camera_node->fmt.fmt.pix.field, camera_node->fmt.fmt.pix.bytesperline, camera_node->fmt.fmt.pix.sizeimage,
-           camera_node->fmt.fmt.pix.colorspace, camera_node->fmt.fmt.pix.priv, camera_node->fmt.fmt.pix.flags,
-           camera_node->fmt.fmt.pix.ycbcr_enc, camera_node->fmt.fmt.pix.quantization, camera_node->fmt.fmt.pix.xfer_func);
-
-    struct v4l2_streamparm parm = {0};
-    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    xioctl(camera_node->fd, VIDIOC_G_PARM, &parm);
-    parm.parm.capture.timeperframe.numerator = 1;
-    parm.parm.capture.timeperframe.denominator = camera_node->parm.parm.capture.timeperframe.denominator;
-    ret = xioctl(camera_node->fd, VIDIOC_S_PARM, &parm);
-    if (ret !=0 ) {
-        printf("line:%d parm set error, errno:%d, str:%s\n", __LINE__, errno, strerror(errno));
-        return -1;
-    }
-
-    printf("fd %d ret %d set Frame rate %.3f fps\n", camera_node->fd, ret,
-           1.0 * parm.parm.capture.timeperframe.denominator / parm.parm.capture.timeperframe.numerator);
-
-    if (-1 == xioctl(camera_node->fd, VIDIOC_REQBUFS, &camera_node->req)) {
-        if (EINVAL == errno) {
-            log_err("%s does not support memory mapping\n", "USBCAMERA");
-            return -1;
-        } else {
-            return -1;
+    while (ret >= 0) {
+        ret = avcodec_receive_frame(dec_ctx, dec_frame);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+            return;
+        else if (ret < 0) {
+            log_err("avcodec_receive_frame failed, error(%s)\n", av_err2str(ret));
+            return;
         }
-    }
 
-    for (camera_node->n_buffers = 0; camera_node->n_buffers < camera_node->req.count; ++camera_node->n_buffers)
-    {
-        struct v4l2_buffer buf;
-        memset(&buf, 0x0, sizeof(struct v4l2_buffer));
+        //log_info("receive video dec_frame %d, %dx%d, pts = %ss",
+        //          dec_ctx->frame_number, dec_frame->width, dec_frame->height, av_ts2timestr(dec_frame->pts, &dec_stream->time_base));
 
-        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.index = camera_node->n_buffers;
-
-        if (-1 == xioctl(camera_node->fd, VIDIOC_QUERYBUF, &buf)) {
-            ret = -1;
+#ifdef DUMP_DEC_YUV
+        int src_y_size = dec_frame->width * dec_frame->height;
+        switch (dec_frame->format) {
+        case AV_PIX_FMT_YUV420P:
+        case AV_PIX_FMT_YUVJ420P:
+            fwrite(dec_frame->data[0], 1, src_y_size,     dec_fp); // Y
+            fwrite(dec_frame->data[1], 1, src_y_size / 4, dec_fp); // U
+            fwrite(dec_frame->data[2], 1, src_y_size / 4, dec_fp); // V
+            break;
+        case AV_PIX_FMT_YUYV422:
+            fwrite(dec_frame->data[0], 1, src_y_size * 2, dec_fp);
+            break;
+        default :
+            log_err("unsupport YUV format %d\n", dec_frame->format);
             break;
         }
+#endif
 
-        camera_node->buffers[camera_node->n_buffers].length = buf.length;
-        camera_node->buffers[camera_node->n_buffers].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE ,MAP_SHARED, camera_node->fd, buf.m.offset);
-        //printf("mmap buffer index:%d buf %p length %d\n", camera_node->n_buffers, camera_node->buffers[camera_node->n_buffers].start, buf.length);
+#ifdef DO_SWS_SCALE
+        sws_process(dec_ctx, sws_ctx, dec_frame, sws_frame, sws_fp);
 
-        if (MAP_FAILED == camera_node->buffers[camera_node->n_buffers].start) {
-            ret = -1;
-            break;
-        }
-    }
+        //log_info("receive video sws_frame, %dx%d, pts = %ss",
+        //          sws_frame->width, sws_frame->height, av_ts2timestr(sws_frame->pts, &dec_stream->time_base));
+#endif
 
-    if ((ret == -1) && (camera_node->n_buffers != 0)) {
-        for (ret = 0; ret < camera_node->n_buffers; ret++) {
-            munmap(camera_node->buffers[camera_node->n_buffers].start, camera_node->buffers[camera_node->n_buffers].length);
-            printf("munmap buffer index:%d buf %p length %ld\n",
-                   camera_node->n_buffers, camera_node->buffers[camera_node->n_buffers].start,
-                   camera_node->buffers[camera_node->n_buffers].length);
-        }
-
-        return -1;
-    }
-
-    return 0;
-}
-
-static int capture_start(struct usbcamera_node *camera_node)
-{
-    unsigned int i;
-    int n_buffers = 0;
-    enum v4l2_buf_type type;
-
-    n_buffers = camera_node->n_buffers;
-    log_info("capture_start fd %d n_buffers %d\n", camera_node->fd, n_buffers);
-
-    for (i = 0; i < n_buffers; ++i) {
-        struct v4l2_buffer buf;
-        memset(&buf, 0x0, sizeof(struct v4l2_buffer));
-
-        buf.index  = i;
-        buf.memory = V4L2_MEMORY_MMAP;
-        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-
-        if (-1 == xioctl(camera_node->fd, VIDIOC_QBUF, &buf)) {
-            log_err("fd %d VIDIOC_QBUF faild\n", camera_node->fd);
-            return -1;
-        }
-    }
-
-    type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (-1 == xioctl(camera_node->fd, VIDIOC_STREAMON, &type)) {
-        log_err("fd %d VIDIOC_STREAMON faild\n", camera_node->fd);
-        return -1;
-    }
-
-    return 0;
-}
-
-static int capture_stop(struct usbcamera_node *camera_node)
-{
-    enum v4l2_buf_type type;
-
-    type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (-1 == xioctl(camera_node->fd, VIDIOC_STREAMOFF, &type)) {
-        printf("fd %d VIDIOC_STREAMOFF faild\n", camera_node->fd);
-        return -1;
-    }
-
-    printf("fd %d VIDIOC_STREAMOFF Ok!\n", camera_node->fd);
-
-    return 0;
-}
-
-static int read_frame(struct usbcamera_node *camera_node, unsigned char *pbuf, unsigned int ch, struct timeval *tvl)
-{
-    int count = 0;
-    int n_buffers = 0;
-    struct v4l2_buffer buf;
-    memset(&buf, 0x0, sizeof(struct v4l2_buffer));
-
-    n_buffers = camera_node->n_buffers;
-
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-    if (-1 == xioctl(camera_node->fd, VIDIOC_DQBUF, &buf)) {
-        switch (errno) {
-        case EAGAIN:
-            return 0;
-        case EIO:
-        default:
-            printf("VIDIOC_DQBUF faild\n");
-            return -1;
-        }
-    }
-
-    if (buf.index > n_buffers) {
-        printf("buf.indx < n_buffers %d %d\n", buf.index, n_buffers);
-        return -1;
-    }
-
-    memcpy(pbuf, camera_node->buffers[buf.index].start, buf.bytesused);
-    tvl->tv_sec = buf.timestamp.tv_sec;
-    tvl->tv_usec = buf.timestamp.tv_usec;
-    count = buf.bytesused;
-
-    if (-1 == xioctl(camera_node->fd, VIDIOC_QBUF, &buf)) {
-        printf("VIDIOC_QBUF faild\n");
-    }
-
-    return count;
-}
-
-void free_camra_resource(struct usbcamera_node *camera_node)
-{
-    int cnt = 0;
-
-    for (cnt = 0; cnt < camera_node->n_buffers; cnt++) {
-        munmap(camera_node->buffers[cnt].start, camera_node->buffers[cnt].length);
-        printf("munmap buffer index:%d buf %p length %ld\n",
-               cnt, camera_node->buffers[cnt].start,
-               camera_node->buffers[cnt].length);
+#ifdef DO_ENCODE
+        encode_process(enc_fmt_ctx, enc_ctx, enc_stream, dec_stream, sws_frame, enc_packet);
+#endif
     }
 }
 
-int read_buffer(void *opaque, uint8_t *pbuf, int buf_size)
-{
-    struct timeval tvl;
-
-    if (poll(usbcamra_poll_fd, usbcamra_poll_fd_num, -1) == -1) {
-        printf("usbcamra poll failed !!!!!!!!!!!!!\n");
-        return AVERROR_EXTERNAL;
-    }
-
-    if ((usbcamra_poll_fd[0].revents & POLLERR) == POLLERR) {
-        printf("usbcamra_poll_fd[0].revents 0x%x\n", usbcamra_poll_fd[0].revents);
-        return AVERROR_EXTERNAL;
-    }
-
-    if (usbcamra_poll_fd[0].revents && POLLIN) {
-        frame_len = read_frame(&usbcamra, pbuf, 0, &tvl);
-        //printf("frame_cnt:%d, frame_len:%d, tvl.tv_sec:%ld ", frame_cnt, frame_len, tvl.tv_sec);
-        //printf("%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
-        //       "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x \n",
-        //       pbuf[0],pbuf[1],pbuf[2],pbuf[3],pbuf[4],pbuf[5],pbuf[6],pbuf[7],pbuf[8],pbuf[9],pbuf[10],pbuf[11],
-        //       pbuf[12],pbuf[13],pbuf[14],pbuf[15],pbuf[16],pbuf[17],pbuf[18],pbuf[19],pbuf[20],pbuf[21],pbuf[22],
-        //       pbuf[23],pbuf[24],pbuf[25],pbuf[26],pbuf[27],pbuf[28],pbuf[29],pbuf[30],pbuf[31]);
-    }
-
-    frame_cnt++;
-    usbcamra_poll_fd[0].revents = 0;
-
-    if (frame_len > buf_size) {
-        printf("frame_len is too big then buf_size\n");
-        return buf_size;
-    }
-
-    return (int)frame_len;
-}
-
-//ffmpeg -f v4l2 -list_formats all -i /dev/video0
-//程序执行：./ffmpeg_usb_rtmp /dev/video0 1280 720 30 1500000
 int main(int argc, char* argv[])
 {
-    int videoindex = -1;
-    unsigned int frame_rate = 0;
+    int ret = -1;
+    char* cmd = NULL;
+    FILE* dec_fp = NULL;
+    FILE* sws_fp = NULL;
+    char* src_url = NULL;
+    char* dst_url = NULL;
+    int video_index = -1;
+    AVDictionary* opt = NULL;
+    const char *format = NULL;
+    AVFrame* dec_frame = NULL;
+    AVFrame* sws_frame = NULL;
+    AVStream *enc_stream = NULL;
+    AVPacket *dec_packet = NULL;
+    AVPacket *enc_packet = NULL;
+    AVCodecContext *enc_ctx = NULL;
+    struct SwsContext *sws_ctx = NULL;
+    AVFormatContext *enc_fmt_ctx = NULL;
 
-    avformat_network_init();
-
-    if (argc != 5) {
-        usbcamra.fmt.fmt.pix.width  = 1280;
-        usbcamra.fmt.fmt.pix.height = 720;
-        frame_rate = 30;
-    } else {
-        usbcamra.fmt.fmt.pix.width  = atoi(argv[2]);
-        usbcamra.fmt.fmt.pix.height = atoi(argv[3]);
-        frame_rate = atoi(argv[4]);
-    }
-
-    sprintf(usbcamra.devname, "%s", argv[1]);
-    printf("width:%d, height:%d, dev:%s", usbcamra.fmt.fmt.pix.width, usbcamra.fmt.fmt.pix.height, usbcamra.devname);
-
-    usbcamra.fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    usbcamra.fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_H264;
-    usbcamra.fmt.fmt.pix.field = V4L2_FIELD_INTERLACED;
-
-    usbcamra.parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    usbcamra.parm.parm.capture.timeperframe.numerator = 1;
-    usbcamra.parm.parm.capture.timeperframe.denominator = frame_rate;
-
-    usbcamra.req.count = 16;
-    usbcamra.req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    usbcamra.req.memory = V4L2_MEMORY_MMAP;
-    usbcamra.buffers = calloc(usbcamra.req.count, sizeof(struct buffer));
-    if (!usbcamra.buffers) {
-        log_err("calloc faild, errno:%d, str:%s\n", errno, strerror(errno));
+    if (argc < 2) {
         return -1;
     }
 
-    log_info("capture init");
-    capture_init(&usbcamra);
+    cmd     = argv[1];
+    format  = argv[2];
+    src_url = argv[3];
+    dst_url = argv[4];
+    avdevice_register_all();
 
-    log_info("capture start");
-    capture_start(&usbcamra);
+    av_log_set_level(AV_LOG_INFO);
 
-    usbcamra_poll_fd[0].fd = usbcamra.fd;
-    usbcamra_poll_fd[0].events = POLLIN;
-    usbcamra_poll_fd_num = 1;
-
-    const char *outUrl = "rtmp://192.168.174.128:1935/live";
-
-    AVFormatContext *ifmt_ctx = NULL;
-
-    ifmt_ctx = avformat_alloc_context();
-    unsigned char* inbuffer = NULL;
-    inbuffer = (unsigned char*)av_malloc(AV_IO_BUF_SIZE);
-    if (!inbuffer) {
-        avformat_free_context(ifmt_ctx);
-        printf("line:%d av_malloc failed!\n", __LINE__);
+    AVFormatContext* in_fmt_ctx = avformat_alloc_context();
+    if (!in_fmt_ctx) {
+        log_err("avformat_alloc_context failed");
         return -1;
     }
 
-    AVIOContext *avio_in = avio_alloc_context(inbuffer, AV_IO_BUF_SIZE, 0, NULL, read_buffer, NULL, NULL);
-    if (!avio_in) {
-        avformat_free_context(ifmt_ctx);
-        av_free((void*)inbuffer);
-        log_err("avio_alloc_context failed");
+    if (strcmp(cmd, "vod") == 0 || strcmp(cmd, "enc") == 0) {
+        ret = avformat_open_input(&in_fmt_ctx, src_url, NULL, NULL);
+        if (ret) {
+            log_err("avformat_open_input failed, error=%d(%s)", ret, av_err2str(ret));
+            return -1;
+        }
+    } else if (strcmp(cmd, "uvc") == 0) {
+        list_device_cap();
 
-        return -1;
-    }
-
-    ifmt_ctx->pb = avio_in;
-    ifmt_ctx->flags = AVFMT_FLAG_CUSTOM_IO;
-
-    int ret = avformat_open_input(&ifmt_ctx, NULL, NULL, NULL);
-    if (ret < 0) {
-        avformat_free_context(ifmt_ctx);
-        av_free((void*)inbuffer);
-        avio_context_free(&avio_in);
-        log_err("avformat_open_input failed, error(%s)", av_err2str(ret));
-
-        return -1;
-    }
-
-    ret = avformat_find_stream_info(ifmt_ctx, NULL);
-    if (ret != 0) {
-        avformat_free_context(ifmt_ctx);
-        av_free((void*)inbuffer);
-        avio_context_free(&avio_in);
-        log_err("avformat_open_input failed, error(%s)", av_err2str(ret));
-
-        return -1;
-    }
-
-    av_dump_format(ifmt_ctx, 0, NULL, 0);
-
-    AVFormatContext * ofmt_ctx = NULL;
-    ret = avformat_alloc_output_context2(&ofmt_ctx, NULL, "flv", outUrl);
-    if (ret < 0) {
-        avformat_free_context(ifmt_ctx);
-        av_free((void*)inbuffer);
-        avio_context_free(&avio_in);
-        avformat_free_context(ofmt_ctx);
-        log_err("error(%s)", av_err2str(ret));
-
-        return -1;
-    }
-
-    for (unsigned int i = 0; i < ifmt_ctx->nb_streams; i++) {
-        AVStream *in_stream = ifmt_ctx->streams[i];
-        if (ifmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            videoindex = i;
+        const AVInputFormat* in_fmt = av_find_input_format("v4l2");
+        if (!in_fmt) {
+            log_err("av_find_input_format failed");
+            return -1;
         }
 
-        AVStream *out_stream = avformat_new_stream(ofmt_ctx, NULL);
-        if (!out_stream) {
-            log_err("avformat_new_stream failed\n");
-            ret = AVERROR_UNKNOWN;
+        av_dict_set(&opt, "video_size", "640x480", 0);
+        ret = avformat_open_input(&in_fmt_ctx, src_url, in_fmt, &opt);
+        if (ret) {
+            log_err("avformat_open_input failed, error=%d(%s)", ret, av_err2str(ret));
+            return -1;
         }
-
-        ret = avcodec_parameters_copy(out_stream->codecpar, in_stream->codecpar);
-        if (ret < 0) {
-            log_err("avcodec_parameters_copy failed, error(%s)\n", av_err2str(ret));
-        }
-
-        log_info("codec_id %d", out_stream->codecpar->codec_id);
-        out_stream->codecpar->codec_id = AV_CODEC_ID_H264;
-        out_stream->codecpar->codec_tag = 0;
     }
 
-    av_dump_format(ofmt_ctx, 0, outUrl, 1);
-
-    log_info("avio_open\n");
-    ret = avio_open(&ofmt_ctx->pb, outUrl, AVIO_FLAG_WRITE);
-    if (ret < 0) {
-        avformat_free_context(ifmt_ctx);
-        av_free((void*)inbuffer);
-        avio_context_free(&avio_in);
-        avformat_free_context(ofmt_ctx);
-        log_err("avio_open failed, error(%s)", av_err2str(ret));
-
+    ret = avformat_find_stream_info(in_fmt_ctx, NULL);
+    if (ret) {
+        log_err("avformat_find_stream_info failed, error=%d(%s)", ret, av_err2str(ret));
         return -1;
     }
 
-    log_info("avformat_write_header\n");
-    ret = avformat_write_header(ofmt_ctx, NULL);
-    if (ret < 0) {
-        avformat_free_context(ifmt_ctx);
-        //if (inbuffer) av_free((void*)inbuffer);
-        avio_context_free(&avio_in);
-        avformat_free_context(ofmt_ctx);
-        log_err("avformat_write_header failed, error(%s)\n", av_err2str(ret));
-
+    video_index = av_find_best_stream(in_fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+    if (video_index) {
+        log_err("av_find_best_stream failed");
         return -1;
     }
 
-    AVPacket *pkt = av_packet_alloc();
-    if (!pkt) {
+    AVCodecContext* dec_ctx = avcodec_alloc_context3(NULL);
+    if (!dec_ctx) {
+        log_err("avcodec_alloc_context3 failed");
+        return -1;
+    }
+
+    avcodec_parameters_to_context(dec_ctx, in_fmt_ctx->streams[video_index]->codecpar);
+
+    const AVCodec* decoder = avcodec_find_decoder(dec_ctx->codec_id);
+    if (!decoder) {
+        log_err("avcodec_find_decoder failed");
+        return -1;
+    }
+
+    ret = avcodec_open2(dec_ctx, decoder, NULL);
+    if (ret) {
+        log_err("avcodec_open2 failed, error=%d(%s)", ret, av_err2str(ret));
+        return -1;
+    }
+
+    dec_packet = av_packet_alloc();
+    if (!dec_packet) {
         log_err("av_packet_alloc failed\n");
         return -1;
     }
 
-    long long start_time = av_gettime();
-    long long frame_index = 0;
-    while (1)
-    {
-        AVStream *in_stream, *out_stream;
-        ret = av_read_frame(ifmt_ctx, pkt);
-        //if (ret < 0) break;
-
-        //if (pkt->pts == AV_NOPTS_VALUE)
-        //{
-        //    AVRational time_base1 = ifmt_ctx->streams[videoindex]->time_base;
-        //    int64_t calc_duration = (double)AV_TIME_BASE / av_q2d(ifmt_ctx->streams[videoindex]->r_frame_rate);
-        //    pkt->pts = (double)(frame_index*calc_duration) / (double)(av_q2d(time_base1)*AV_TIME_BASE);
-        //    pkt->dts = pkt->pts;
-        //    pkt->duration = (double)calc_duration / (double)(av_q2d(time_base1)*AV_TIME_BASE);
-        //}
-
-        //if (pkt->stream_index == videoindex)
-        //{
-        //    AVRational time_base = ifmt_ctx->streams[videoindex]->time_base;
-        //    AVRational time_base_q = { 1,AV_TIME_BASE };
-        //    int64_t pts_time = av_rescale_q(pkt->dts, time_base, time_base_q);
-        //    int64_t now_time = av_gettime() - start_time;
-
-        //    AVRational avr = ifmt_ctx->streams[videoindex]->time_base;
-        //    printf("avr.num:%d, avr.den:%d, pkt.dts:%ld, pkt.pts:%ld, pts_time:%ld\n",
-        //            avr.num,    avr.den,    pkt->dts,     pkt->pts,     pts_time);
-        //    if (pts_time > now_time)
-        //    {
-        //        printf("pts_time:%ld, now_time:%ld\n", pts_time, now_time);
-        //        av_usleep((unsigned int)(pts_time - now_time));
-        //    }
-        //}
-
-        //in_stream = ifmt_ctx->streams[pkt->stream_index];
-        //out_stream = ofmt_ctx->streams[pkt->stream_index];
-
-        //pkt->pts = av_rescale_q_rnd(pkt->pts, in_stream->time_base, out_stream->time_base, (AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
-        //pkt->dts = av_rescale_q_rnd(pkt->dts, in_stream->time_base, out_stream->time_base, (AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
-        //pkt->duration = (int)av_rescale_q(pkt->duration, in_stream->time_base, out_stream->time_base);
-        //pkt->pos = -1;
-        //if (pkt->stream_index == videoindex) {
-        //    printf("Send %8lld video frames to output URL\n", frame_index);
-        //    frame_index++;
-        //}
-
-        //ret = av_interleaved_write_frame(ofmt_ctx, pkt);
-        //if (ret < 0) {
-        //    printf("av_interleaved_write_frame failed\n");
-        //    break;
-        //}
-
-        av_packet_unref(pkt);
+    dec_frame = av_frame_alloc();
+    if (!dec_frame) {
+        log_err("av_frame_alloc failed\n");
+        return -1;
     }
 
-    log_info("capture_stop");
-    capture_stop(&usbcamra);
+#ifdef DUMP_DEC_YUV
+    char dec_file[64] = {0};
+    sprintf(dec_file, "%dx%d_dec.yuv", dec_ctx->width, dec_ctx->height);
+    dec_fp = fopen(dec_file, "wb+");
+    if (!dec_fp) {
+        log_err("fopen %s failed", dec_file);
+        return -1;
+    }
+#endif
 
-    av_packet_free(&pkt);
-    free_camra_resource(&usbcamra);
-    avformat_free_context(ifmt_ctx);
-    av_free((void*)inbuffer);
-    avio_context_free(&avio_in);
-    avformat_free_context(ofmt_ctx);
+#ifdef DO_SWS_SCALE
+    sws_frame = av_frame_alloc();
+    if (!sws_frame) {
+        log_err("av_frame_alloc failed\n");
+        return -1;
+    }
+
+    sws_ctx = sws_getContext(dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt, dec_ctx->width,
+                             dec_ctx->height, AV_PIX_FMT_YUV420P, SWS_BICUBIC, NULL, NULL, NULL);
+    if (!sws_ctx) {
+        log_err("sws_getContext failed");
+        return -1;
+    }
+
+    int frame_bytes = av_image_get_buffer_size(AV_PIX_FMT_YUV420P, dec_ctx->width, dec_ctx->height, 1);
+
+    uint8_t* sws_buffer = (unsigned char*)av_malloc(frame_bytes * sizeof(unsigned char));
+    if (!sws_buffer) {
+        log_err("av_malloc failed");
+        return -1;
+    }
+
+    sws_frame->width  = dec_ctx->width;
+    sws_frame->height = dec_ctx->height;
+    sws_frame->format = AV_PIX_FMT_YUV420P;
+    ret = av_image_fill_arrays(sws_frame->data, sws_frame->linesize, sws_buffer,
+                               AV_PIX_FMT_YUV420P, dec_ctx->width, dec_ctx->height, 1);
+    if (ret < 0) {
+        log_err("av_image_fill_arrays failed, error=%d(%s)", ret, av_err2str(ret));
+        return -1;
+    }
+
+#ifdef DUMP_SWS_YUV
+    char sws_file[64] = {0};
+    sprintf(sws_file, "%dx%d_sws.yuv", sws_frame->width, sws_frame->height);
+    sws_fp = fopen(sws_file, "wb+");
+    if (!dec_fp) {
+        log_err("fopen %s failed", dec_file);
+        return -1;
+    }
+#endif
+#endif
+
+#ifdef DO_ENCODE
+    enc_packet = av_packet_alloc();
+    if (!dec_packet) {
+        log_err("av_packet_alloc failed\n");
+        return -1;
+    }
+
+    enc_fmt_ctx = avformat_alloc_context();
+    if (!enc_fmt_ctx) {
+        log_err("avformat_alloc_context failed");
+        return -1;
+    }
+
+    ret = avformat_alloc_output_context2(&enc_fmt_ctx, NULL, format, dst_url);
+    if (ret < 0) {
+        log_err("avformat_alloc_output_context2 failed, error=%d(%s)", ret, av_err2str(ret));
+        return -1;
+    }
+
+    enc_stream = avformat_new_stream(enc_fmt_ctx, NULL);
+    if (!enc_stream) {
+        log_err("avformat_new_stream failed");
+        return -1;
+    }
+
+    const AVCodec *enc_codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+    if (!enc_codec) {
+        log_err("avcodec_find_encoder failed");
+        return -1;
+    }
+
+    enc_ctx = avcodec_alloc_context3(enc_codec);
+    if (!enc_ctx) {
+        log_err("avcodec_alloc_context3 failed");
+        return -1;
+    }
+
+    enc_ctx->gop_size   = 10;
+    enc_ctx->width      = ENC_WIDTH;
+    enc_ctx->height     = ENC_HEIGHT;
+    enc_ctx->bit_rate   = 110000;
+    enc_ctx->pix_fmt    = AV_PIX_FMT_YUV420P;
+    enc_ctx->codec_type = AVMEDIA_TYPE_VIDEO;
+    enc_ctx->codec_id   = AV_CODEC_ID_H264;
+    enc_ctx->time_base  = (AVRational){ 1, 15 };
+
+    if (enc_ctx->codec_id == AV_CODEC_ID_H264) {
+        enc_ctx->qmin         = 10;
+        enc_ctx->qmax         = 51;
+        enc_ctx->max_b_frames = 0;
+        enc_ctx->qcompress    = 0.6;
+    } else if (enc_ctx->codec_id == AV_CODEC_ID_MPEG2VIDEO) {
+        enc_ctx->max_b_frames = 2;
+    } else if (enc_ctx->codec_id == AV_CODEC_ID_MPEG1VIDEO) {
+        enc_ctx->mb_decision  = 2;
+    }
+
+    if (enc_fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER)
+        enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+    ret = avcodec_open2(enc_ctx, enc_codec, NULL);
+    if (ret < 0) {
+        log_err("avcodec_open2 failed, error=%d(%s)", ret, av_err2str(ret));
+        return -1;
+    }
+
+    ret = avcodec_parameters_from_context(enc_stream->codecpar, enc_ctx);
+    if (ret < 0) {
+        log_err("avcodec_parameters_from_context failed, error(%s)", av_err2str(ret));
+        return -1;
+    }
+
+    enc_stream->time_base    = enc_ctx->time_base;
+    enc_stream->r_frame_rate = av_inv_q(enc_ctx->time_base);
+
+    av_dump_format(enc_fmt_ctx, 0, dst_url, 1);
+
+    if (!(enc_fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
+        ret = avio_open(&enc_fmt_ctx->pb, dst_url, AVIO_FLAG_READ_WRITE);
+        if (ret < 0) {
+            log_err("avio_open failed, error=%d(%s)", ret, av_err2str(ret));
+            return -1;
+        }
+    }
+
+    ret = avformat_write_header(enc_fmt_ctx, NULL);
+    if (ret < 0) {
+        log_err("avformat_write_header failed, error=%d(%s)", ret, av_err2str(ret));
+        return -1;
+    }
+#endif
+
+    while (av_read_frame(in_fmt_ctx, dec_packet) >= 0) {
+        if (dec_packet->stream_index == video_index) {
+            AVRational time_base = in_fmt_ctx->streams[video_index]->time_base;
+            int64_t duration = (double)AV_TIME_BASE / av_q2d(in_fmt_ctx->streams[video_index]->r_frame_rate);
+
+            if (dec_packet->pts == AV_NOPTS_VALUE) {
+                dec_packet->pts = (double)(dec_ctx->frame_number * duration) / (double)(av_q2d(time_base)*AV_TIME_BASE);
+                dec_packet->dts = dec_packet->pts;
+                dec_packet->duration = (double)duration / (double)(av_q2d(time_base)*AV_TIME_BASE);
+            }
+
+            //log_info("send video dec_packet %d, pts(%s %ss %ldus)",
+            //          dec_ctx->frame_number, av_ts2str(dec_packet->pts),
+            //          av_ts2timestr(dec_packet->pts, &time_base),
+            //          av_rescale_q(dec_packet->pts, time_base, AV_TIME_BASE_Q));
+
+            decode_process(dec_ctx, in_fmt_ctx->streams[video_index], sws_ctx, enc_fmt_ctx,
+                           enc_ctx, enc_stream, dec_packet, dec_frame, sws_frame, enc_packet, dec_fp, sws_fp);
+        }
+
+        av_packet_unref(dec_packet);
+    }
+
+    decode_process(dec_ctx, in_fmt_ctx->streams[video_index], sws_ctx, enc_fmt_ctx,
+                   enc_ctx, enc_stream, NULL, dec_frame, sws_frame, enc_packet, dec_fp, sws_fp);
+
+    if (dec_fp) fclose(dec_fp);
+
+    if (sws_fp) fclose(sws_fp);
+
+    if (dec_ctx) avcodec_free_context(&dec_ctx);
+
+    av_dict_free(&opt);
+    av_frame_free(&dec_frame);
+#ifdef DO_SWS_SCALE
+    av_free(sws_buffer);
+    av_frame_free(&sws_frame);
+#endif
+#ifdef DO_ENCODE
+    av_write_trailer(enc_fmt_ctx);
+    av_packet_free(&enc_packet);
+    avcodec_free_context(&enc_ctx);
+    avcodec_close(enc_ctx);
+    avformat_close_input(&enc_fmt_ctx);
+#endif
+    av_packet_free(&dec_packet);
+    avformat_free_context(in_fmt_ctx);
 
     return 0;
 }
-
