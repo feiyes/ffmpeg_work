@@ -17,14 +17,18 @@
 
 typedef struct InputContext {
     FILE* fp;
+    int a_idx;
+    int v_idx;
     AVFrame*  frame;
     AVPacket* packet;
-    AVCodecContext*  dec_ctx;
+    AVCodecContext*  a_ctx;
+    AVCodecContext*  v_ctx;
     AVFormatContext* fmt_ctx;
 } InputContext;
 
 typedef struct SwsContext {
     FILE* fp;
+    uint8_t* buffer;
     AVFrame* frame;
     struct SwsContext *sws_ctx;
 } SwsContext;
@@ -58,15 +62,35 @@ void list_device_cap()
     avformat_free_context(fmt_ctx);
 }
 
-void sws_process(AVCodecContext* dec_ctx, struct SwsContext *sws_ctx,
+void dump_yuv(AVFrame* frame, FILE* fp)
+{
+    int src_y_size = frame->width * frame->height;
+
+    switch (frame->format) {
+    case AV_PIX_FMT_YUV420P:
+    case AV_PIX_FMT_YUVJ420P:
+        fwrite(frame->data[0], 1, src_y_size,     fp); // Y
+        fwrite(frame->data[1], 1, src_y_size / 4, fp); // U
+        fwrite(frame->data[2], 1, src_y_size / 4, fp); // V
+        break;
+    case AV_PIX_FMT_YUYV422:
+        fwrite(frame->data[0], 1, src_y_size * 2, fp);
+        break;
+    default:
+        log_err("unsupport YUV format %d\n", frame->format);
+        break;
+    }
+}
+
+void sws_process(AVCodecContext* v_ctx, struct SwsContext *sws_ctx,
                  AVFrame* dec_frame, AVFrame* sws_frame, FILE* fp)
 {
-    sws_frame->pts       = dec_frame->pts;
-    sws_frame->pkt_dts   = dec_frame->pkt_dts;
-    sws_frame->time_base = dec_frame->time_base;
-    sws_frame->duration  = dec_frame->duration;
+    sws_frame->pts          = dec_frame->pts;
+    sws_frame->pkt_dts      = dec_frame->pkt_dts;
+    sws_frame->time_base    = dec_frame->time_base;
+    sws_frame->pkt_duration = dec_frame->pkt_duration;
     sws_scale(sws_ctx, (const uint8_t* const*)dec_frame->data, dec_frame->linesize,
-              0, dec_ctx->height, sws_frame->data, sws_frame->linesize);
+              0, v_ctx->height, sws_frame->data, sws_frame->linesize);
 
 #ifdef DUMP_SWS_YUV
     int sws_y_size = sws_frame->width * sws_frame->height;
@@ -121,14 +145,14 @@ void decode_process(InputContext* i, SwsContext* s, OutputContext* o)
 {
     int ret = -1;
 
-    ret = avcodec_send_packet(i->dec_ctx, i->packet);
+    ret = avcodec_send_packet(i->v_ctx, i->packet);
     if (ret < 0) {
         log_err("avcodec_send_packet failed, error(%s)\n", av_err2str(ret));
         return;
     }
 
     while (ret >= 0) {
-        ret = avcodec_receive_frame(i->dec_ctx, i->frame);
+        ret = avcodec_receive_frame(i->v_ctx, i->frame);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
             return;
         else if (ret < 0) {
@@ -137,25 +161,13 @@ void decode_process(InputContext* i, SwsContext* s, OutputContext* o)
         }
 
 #ifdef DUMP_DEC_YUV
-        int src_y_size = i->frame->width * i->frame->height;
-        switch (i->frame->format) {
-        case AV_PIX_FMT_YUV420P:
-        case AV_PIX_FMT_YUVJ420P:
-            fwrite(i->frame->data[0], 1, src_y_size,     i->fp); // Y
-            fwrite(i->frame->data[1], 1, src_y_size / 4, i->fp); // U
-            fwrite(i->frame->data[2], 1, src_y_size / 4, i->fp); // V
-            break;
-        case AV_PIX_FMT_YUYV422:
-            fwrite(i->frame->data[0], 1, src_y_size * 2, i->fp);
-            break;
-        default:
-            log_err("unsupport YUV format %d\n", i->frame->format);
-            break;
+        if (i->packet->stream_index == i->v_idx) {
+            dump_yuv(i->frame, i->fp);
         }
 #endif
 
 #ifdef DO_SWS_SCALE
-        sws_process(i->dec_ctx, s->sws_ctx, i->frame, s->frame, s->fp);
+        sws_process(i->v_ctx, s->sws_ctx, i->frame, s->frame, s->fp);
 #endif
 
 #ifdef DO_ENCODE
@@ -164,18 +176,282 @@ void decode_process(InputContext* i, SwsContext* s, OutputContext* o)
     }
 }
 
+int open_input(char* cmd, char* in_url, InputContext* ic)
+{
+    int ret = -1;
+    AVDictionary* opt = NULL;
+
+    ic->fmt_ctx = avformat_alloc_context();
+    if (!ic->fmt_ctx) {
+        log_err("avformat_alloc_context failed");
+        return -1;
+    }
+
+    if (strcmp(cmd, "vod") == 0 || strcmp(cmd, "enc") == 0) {
+        ret = avformat_open_input(&ic->fmt_ctx, in_url, NULL, NULL);
+        if (ret) {
+            log_err("avformat_open_input failed, error=%d(%s)", ret, av_err2str(ret));
+            return -1;
+        }
+    } else if (strcmp(cmd, "uvc") == 0) {
+        list_device_cap();
+
+        const AVInputFormat* in_fmt = av_find_input_format("v4l2");
+        if (!in_fmt) {
+            log_err("av_find_input_format failed");
+            return -1;
+        }
+
+        av_dict_set(&opt, "video_size", "640x480", 0);
+        ret = avformat_open_input(&ic->fmt_ctx, in_url, in_fmt, &opt);
+        if (ret) {
+            log_err("avformat_open_input failed, error=%d(%s)", ret, av_err2str(ret));
+            return -1;
+        }
+    }
+
+    ret = avformat_find_stream_info(ic->fmt_ctx, NULL);
+    if (ret) {
+        log_err("avformat_find_stream_info failed, error=%d(%s)", ret, av_err2str(ret));
+        return -1;
+    }
+
+    av_dump_format(ic->fmt_ctx, 0, in_url, 0);
+
+    for (int i = 0; i < ic->fmt_ctx->nb_streams; i++) {
+        AVStream* stream = ic->fmt_ctx->streams[i];
+        AVCodecParameters* codecpar = stream->codecpar;
+
+        if (codecpar->codec_type != AVMEDIA_TYPE_AUDIO &&
+            codecpar->codec_type != AVMEDIA_TYPE_VIDEO) {
+            continue;
+        }
+
+        const AVCodec* codec = avcodec_find_decoder(codecpar->codec_id);
+        if (!codec) {
+            log_err("avcodec_find_decoder %s failed\n", avcodec_get_name(codecpar->codec_id));
+            return -1;
+        }
+
+        AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
+        if (!codec_ctx) {
+            log_err("avcodec_alloc_context3 failed\n");
+            return -1;
+        }
+
+        ret = avcodec_parameters_to_context(codec_ctx, codecpar);
+        if (ret < 0) {
+            log_err("avcodec_parameters_to_context failed");
+            return -1;
+        }
+
+        ret = avcodec_open2(codec_ctx, codec, NULL);
+        if (ret < 0) {
+            log_err("avcodec_open2 failed, error(%s)", av_err2str(ret));
+            return -1;
+        }
+
+        codec_ctx->time_base = stream->time_base;
+
+        if (codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            ic->a_idx = i;
+            ic->a_ctx = codec_ctx;
+            log_info("audio codec %s", avcodec_get_name(codecpar->codec_id));
+        } else if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            ic->v_idx = i;
+            ic->v_ctx = codec_ctx;
+            log_info("video codec %s, delay %d", avcodec_get_name(codecpar->codec_id), codecpar->video_delay);
+        }
+    }
+
+    ic->packet = av_packet_alloc();
+    if (!ic->packet) {
+        log_err("av_packet_alloc failed\n");
+        return -1;
+    }
+
+    ic->frame = av_frame_alloc();
+    if (!ic->frame) {
+        log_err("av_frame_alloc failed\n");
+        return -1;
+    }
+
+#ifdef DUMP_DEC_YUV
+    char dec_file[64] = {0};
+    sprintf(dec_file, "%dx%d_dec.yuv", ic->v_ctx->width, ic->v_ctx->height);
+    ic->fp = fopen(dec_file, "wb+");
+    if (!ic->fp) {
+        log_err("fopen %s failed", dec_file);
+        return -1;
+    }
+#endif
+
+    av_dict_free(&opt);
+
+    return 0;
+}
+
+#ifdef DO_SWS_SCALE
+int open_filter(InputContext* ic, SwsContext* sc)
+{
+    int ret = -1;
+
+    sc->frame = av_frame_alloc();
+    if (!sc->frame) {
+        log_err("av_frame_alloc failed\n");
+        return -1;
+    }
+
+    sc->frame->width  = ic->v_ctx->width;
+    sc->frame->height = ic->v_ctx->height;
+    sc->frame->format = AV_PIX_FMT_YUV420P;
+    sc->sws_ctx = sws_getContext(ic->v_ctx->width, ic->v_ctx->height, ic->v_ctx->pix_fmt,
+                                 sc->frame->width, sc->frame->height, sc->frame->format,
+                                 SWS_BICUBIC, NULL, NULL, NULL);
+    if (!sc->sws_ctx) {
+        log_err("sws_getContext failed");
+        return -1;
+    }
+
+    int frame_bytes = av_image_get_buffer_size(sc->frame->format, sc->frame->width, sc->frame->height, 1);
+
+    sc->buffer = (unsigned char*)av_malloc(frame_bytes * sizeof(unsigned char));
+    if (!sc->buffer) {
+        log_err("av_malloc failed");
+        return -1;
+    }
+
+    ret = av_image_fill_arrays(sc->frame->data,   sc->frame->linesize, sc->buffer,
+                               sc->frame->format, sc->frame->width, sc->frame->height, 1);
+    if (ret < 0) {
+        log_err("av_image_fill_arrays failed, error=%d(%s)", ret, av_err2str(ret));
+        return -1;
+    }
+
+#ifdef DUMP_SWS_YUV
+    char sws_file[64] = {0};
+    sprintf(sws_file, "%dx%d_sws.yuv", sc->frame->width, sc->frame->height);
+    sc->fp = fopen(sws_file, "wb+");
+    if (!sc->fp) {
+        log_err("fopen %s failed", sws_file);
+        return -1;
+    }
+#endif
+
+    return 0;
+}
+#endif
+
+#ifdef DO_ENCODE
+int open_output(char* venc_name, const char *out_format, char* out_url, OutputContext* oc)
+{
+    int ret = -1;
+
+    oc->packet = av_packet_alloc();
+    if (!oc->packet) {
+        log_err("av_packet_alloc failed\n");
+        return -1;
+    }
+
+    oc->fmt_ctx = avformat_alloc_context();
+    if (!oc->fmt_ctx) {
+        log_err("avformat_alloc_context failed");
+        return -1;
+    }
+
+    ret = avformat_alloc_output_context2(&oc->fmt_ctx, NULL, out_format, out_url);
+    if (ret < 0) {
+        log_err("avformat_alloc_output_context2 failed, error=%d(%s)", ret, av_err2str(ret));
+        return -1;
+    }
+
+    oc->stream = avformat_new_stream(oc->fmt_ctx, NULL);
+    if (!oc->stream) {
+        log_err("avformat_new_stream failed");
+        return -1;
+    }
+
+    const AVCodec *enc_codec = avcodec_find_encoder_by_name(venc_name);
+    if (!enc_codec) {
+        log_err("avcodec_find_encoder failed");
+        return -1;
+    }
+
+    oc->enc_ctx = avcodec_alloc_context3(enc_codec);
+    if (!oc->enc_ctx) {
+        log_err("avcodec_alloc_context3 failed");
+        return -1;
+    }
+
+    oc->enc_ctx->bit_rate   = 110000;
+    oc->enc_ctx->gop_size   = ENC_GOP;
+    oc->enc_ctx->width      = ENC_WIDTH;
+    oc->enc_ctx->height     = ENC_HEIGHT;
+    oc->enc_ctx->codec_id   = enc_codec->id;
+    oc->enc_ctx->pix_fmt    = AV_PIX_FMT_YUV420P;
+    oc->enc_ctx->codec_type = AVMEDIA_TYPE_VIDEO;
+    oc->enc_ctx->time_base  = (AVRational){ 1, ENC_FPS };
+
+    if (oc->enc_ctx->codec_id == AV_CODEC_ID_H264 ||
+        oc->enc_ctx->codec_id == AV_CODEC_ID_H265) {
+        oc->enc_ctx->qmin         = 10;
+        oc->enc_ctx->qmax         = 51;
+        oc->enc_ctx->qcompress    = 0.6;
+        oc->enc_ctx->max_b_frames = 2;
+    } else if (oc->enc_ctx->codec_id == AV_CODEC_ID_MPEG2VIDEO) {
+        oc->enc_ctx->max_b_frames = 2;
+    } else if (oc->enc_ctx->codec_id == AV_CODEC_ID_MPEG1VIDEO) {
+        oc->enc_ctx->mb_decision  = 2;
+    }
+
+    if (oc->fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER)
+        oc->enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+    ret = avcodec_open2(oc->enc_ctx, enc_codec, NULL);
+    if (ret < 0) {
+        log_err("avcodec_open2 failed, error=%d(%s)", ret, av_err2str(ret));
+        return -1;
+    }
+
+    ret = avcodec_parameters_from_context(oc->stream->codecpar, oc->enc_ctx);
+    if (ret < 0) {
+        log_err("avcodec_parameters_from_context failed, error(%s)", av_err2str(ret));
+        return -1;
+    }
+
+    oc->stream->time_base    = oc->enc_ctx->time_base;
+    oc->stream->r_frame_rate = av_inv_q(oc->enc_ctx->time_base);
+
+    av_dump_format(oc->fmt_ctx, 0, out_url, 1);
+
+    if (!(oc->fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
+        ret = avio_open(&oc->fmt_ctx->pb, out_url, AVIO_FLAG_READ_WRITE);
+        if (ret < 0) {
+            log_err("avio_open failed, error=%d(%s)", ret, av_err2str(ret));
+            return -1;
+        }
+    }
+
+    ret = avformat_write_header(oc->fmt_ctx, NULL);
+    if (ret < 0) {
+        log_err("avformat_write_header failed, error=%d(%s)", ret, av_err2str(ret));
+        return -1;
+    }
+
+    return 0;
+}
+#endif
+
 int main(int argc, char* argv[])
 {
     int ret = -1;
     char* cmd = NULL;
     char* in_url = NULL;
     char* out_url = NULL;
-    int video_index = -1;
-    SwsContext    s = {0};
-    InputContext  i = {0};
-    OutputContext o = {0};
+    SwsContext    sc = {0};
+    InputContext  ic = {0};
+    OutputContext oc = {0};
     char* venc_name = NULL;
-    AVDictionary* opt = NULL;
     const char *out_format = NULL;
 
     if (argc < 2) {
@@ -192,261 +468,60 @@ int main(int argc, char* argv[])
 
     av_log_set_level(AV_LOG_INFO);
 
-    i.fmt_ctx = avformat_alloc_context();
-    if (!i.fmt_ctx) {
-        log_err("avformat_alloc_context failed");
-        return -1;
-    }
-
-    if (strcmp(cmd, "vod") == 0 || strcmp(cmd, "enc") == 0) {
-        ret = avformat_open_input(&i.fmt_ctx, in_url, NULL, NULL);
-        if (ret) {
-            log_err("avformat_open_input failed, error=%d(%s)", ret, av_err2str(ret));
-            return -1;
-        }
-    } else if (strcmp(cmd, "uvc") == 0) {
-        list_device_cap();
-
-        const AVInputFormat* in_fmt = av_find_input_format("v4l2");
-        if (!in_fmt) {
-            log_err("av_find_input_format failed");
-            return -1;
-        }
-
-        av_dict_set(&opt, "video_size", "640x480", 0);
-        ret = avformat_open_input(&i.fmt_ctx, in_url, in_fmt, &opt);
-        if (ret) {
-            log_err("avformat_open_input failed, error=%d(%s)", ret, av_err2str(ret));
-            return -1;
-        }
-    }
-
-    ret = avformat_find_stream_info(i.fmt_ctx, NULL);
-    if (ret) {
-        log_err("avformat_find_stream_info failed, error=%d(%s)", ret, av_err2str(ret));
-        return -1;
-    }
-
-    video_index = av_find_best_stream(i.fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
-    if (video_index) {
-        log_err("av_find_best_stream failed");
-        return -1;
-    }
-
-    i.dec_ctx = avcodec_alloc_context3(NULL);
-    if (!i.dec_ctx) {
-        log_err("avcodec_alloc_context3 failed");
-        return -1;
-    }
-
-    avcodec_parameters_to_context(i.dec_ctx, i.fmt_ctx->streams[video_index]->codecpar);
-
-    const AVCodec* decoder = avcodec_find_decoder(i.dec_ctx->codec_id);
-    if (!decoder) {
-        log_err("avcodec_find_decoder failed");
-        return -1;
-    }
-
-    ret = avcodec_open2(i.dec_ctx, decoder, NULL);
-    if (ret) {
-        log_err("avcodec_open2 failed, error=%d(%s)", ret, av_err2str(ret));
-        return -1;
-    }
-
-    i.packet = av_packet_alloc();
-    if (!i.packet) {
-        log_err("av_packet_alloc failed\n");
-        return -1;
-    }
-
-    i.frame = av_frame_alloc();
-    if (!i.frame) {
-        log_err("av_frame_alloc failed\n");
-        return -1;
-    }
-
-    av_dump_format(i.fmt_ctx, 0, in_url, 0);
-
-#ifdef DUMP_DEC_YUV
-    char dec_file[64] = {0};
-    sprintf(dec_file, "%dx%d_dec.yuv", i.dec_ctx->width, i.dec_ctx->height);
-    i.fp = fopen(dec_file, "wb+");
-    if (!i.fp) {
-        log_err("fopen %s failed", dec_file);
-        return -1;
-    }
-#endif
+    ret = open_input(cmd, in_url, &ic);
+    if (ret < 0) return -1;
 
 #ifdef DO_SWS_SCALE
-    s.frame = av_frame_alloc();
-    if (!s.frame) {
-        log_err("av_frame_alloc failed\n");
-        return -1;
-    }
-
-    s.frame->width  = i.dec_ctx->width;
-    s.frame->height = i.dec_ctx->height;
-    s.frame->format = AV_PIX_FMT_YUV420P;
-    s.sws_ctx = sws_getContext(i.dec_ctx->width, i.dec_ctx->height, i.dec_ctx->pix_fmt,
-                               s.frame->width, s.frame->height, s.frame->format, SWS_BICUBIC, NULL, NULL, NULL);
-    if (!s.sws_ctx) {
-        log_err("sws_getContext failed");
-        return -1;
-    }
-
-    int frame_bytes = av_image_get_buffer_size(s.frame->format, s.frame->width, s.frame->height, 1);
-
-    uint8_t* sws_buffer = (unsigned char*)av_malloc(frame_bytes * sizeof(unsigned char));
-    if (!sws_buffer) {
-        log_err("av_malloc failed");
-        return -1;
-    }
-
-    ret = av_image_fill_arrays(s.frame->data,   s.frame->linesize, sws_buffer,
-                               s.frame->format, s.frame->width, s.frame->height, 1);
-    if (ret < 0) {
-        log_err("av_image_fill_arrays failed, error=%d(%s)", ret, av_err2str(ret));
-        return -1;
-    }
-
-#ifdef DUMP_SWS_YUV
-    char sws_file[64] = {0};
-    sprintf(sws_file, "%dx%d_sws.yuv", s.frame->width, s.frame->height);
-    s.fp = fopen(sws_file, "wb+");
-    if (!s.fp) {
-        log_err("fopen %s failed", sws_file);
-        return -1;
-    }
-#endif
+    ret = open_filter(&ic, &sc);
+    if (ret < 0) return -1;
 #endif
 
 #ifdef DO_ENCODE
-    o.packet = av_packet_alloc();
-    if (!o.packet) {
-        log_err("av_packet_alloc failed\n");
-        return -1;
-    }
-
-    o.fmt_ctx = avformat_alloc_context();
-    if (!o.fmt_ctx) {
-        log_err("avformat_alloc_context failed");
-        return -1;
-    }
-
-    ret = avformat_alloc_output_context2(&o.fmt_ctx, NULL, out_format, out_url);
-    if (ret < 0) {
-        log_err("avformat_alloc_output_context2 failed, error=%d(%s)", ret, av_err2str(ret));
-        return -1;
-    }
-
-    o.stream = avformat_new_stream(o.fmt_ctx, NULL);
-    if (!o.stream) {
-        log_err("avformat_new_stream failed");
-        return -1;
-    }
-
-    const AVCodec *enc_codec = avcodec_find_encoder_by_name(venc_name);
-    if (!enc_codec) {
-        log_err("avcodec_find_encoder failed");
-        return -1;
-    }
-
-    o.enc_ctx = avcodec_alloc_context3(enc_codec);
-    if (!o.enc_ctx) {
-        log_err("avcodec_alloc_context3 failed");
-        return -1;
-    }
-
-    o.enc_ctx->bit_rate   = 110000;
-    o.enc_ctx->gop_size   = ENC_GOP;
-    o.enc_ctx->width      = ENC_WIDTH;
-    o.enc_ctx->height     = ENC_HEIGHT;
-    o.enc_ctx->codec_id   = enc_codec->id;
-    o.enc_ctx->pix_fmt    = AV_PIX_FMT_YUV420P;
-    o.enc_ctx->codec_type = AVMEDIA_TYPE_VIDEO;
-    o.enc_ctx->time_base  = (AVRational){ 1, ENC_FPS };
-
-    if (o.enc_ctx->codec_id == AV_CODEC_ID_H264 ||
-        o.enc_ctx->codec_id == AV_CODEC_ID_H265) {
-        o.enc_ctx->qmin         = 10;
-        o.enc_ctx->qmax         = 51;
-        o.enc_ctx->qcompress    = 0.6;
-        o.enc_ctx->max_b_frames = 2;
-    } else if (o.enc_ctx->codec_id == AV_CODEC_ID_MPEG2VIDEO) {
-        o.enc_ctx->max_b_frames = 2;
-    } else if (o.enc_ctx->codec_id == AV_CODEC_ID_MPEG1VIDEO) {
-        o.enc_ctx->mb_decision  = 2;
-    }
-
-    if (o.fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER)
-        o.enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-
-    ret = avcodec_open2(o.enc_ctx, enc_codec, NULL);
-    if (ret < 0) {
-        log_err("avcodec_open2 failed, error=%d(%s)", ret, av_err2str(ret));
-        return -1;
-    }
-
-    ret = avcodec_parameters_from_context(o.stream->codecpar, o.enc_ctx);
-    if (ret < 0) {
-        log_err("avcodec_parameters_from_context failed, error(%s)", av_err2str(ret));
-        return -1;
-    }
-
-    o.stream->time_base    = o.enc_ctx->time_base;
-    o.stream->r_frame_rate = av_inv_q(o.enc_ctx->time_base);
-
-    av_dump_format(o.fmt_ctx, 0, out_url, 1);
-
-    if (!(o.fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
-        ret = avio_open(&o.fmt_ctx->pb, out_url, AVIO_FLAG_READ_WRITE);
-        if (ret < 0) {
-            log_err("avio_open failed, error=%d(%s)", ret, av_err2str(ret));
-            return -1;
-        }
-    }
-
-    ret = avformat_write_header(o.fmt_ctx, NULL);
-    if (ret < 0) {
-        log_err("avformat_write_header failed, error=%d(%s)", ret, av_err2str(ret));
-        return -1;
-    }
+    ret = open_output(venc_name, out_format, out_url, &oc);
+    if (ret < 0) return -1;
 #endif
 
-    while (av_read_frame(i.fmt_ctx, i.packet) >= 0) {
-        if (i.packet->stream_index == video_index) {
-            i.packet->pts = i.dec_ctx->frame_number;
-            decode_process(&i, &s, &o);
+    while (av_read_frame(ic.fmt_ctx, ic.packet) >= 0) {
+        if (ic.packet->stream_index == ic.v_idx) {
+            ic.packet->pts = ic.v_ctx->frame_number;
+            decode_process(&ic, &sc, &oc);
+        } else if (ic.packet->stream_index == ic.a_idx) {
+            ic.packet->pts = ic.a_ctx->frame_number;
+            decode_process(&ic, &sc, &oc);
         }
 
-        av_packet_unref(i.packet);
+        av_packet_unref(ic.packet);
     }
 
-    i.packet = NULL;
-    decode_process(&i, &s, &o);
+    if (ic.v_ctx) {
+        ic.packet = NULL;
+        decode_process(&ic, &sc, &oc);
+    } else if (ic.a_ctx) {
+        ic.packet = NULL;
+        decode_process(&ic, &sc, &oc);
+    }
 
-    if (i.fp) fclose(i.fp);
+    if (ic.fp) fclose(ic.fp);
 
-    if (s.fp) fclose(s.fp);
+    if (sc.fp) fclose(sc.fp);
 
-    if (i.dec_ctx) avcodec_free_context(&i.dec_ctx);
+    if (ic.v_ctx) avcodec_free_context(&ic.v_ctx);
 
-    av_dict_free(&opt);
-    av_frame_free(&i.frame);
+    av_frame_free(&ic.frame);
 #ifdef DO_SWS_SCALE
-    av_free(sws_buffer);
-    av_frame_free(&s.frame);
+    av_free(sc.buffer);
+    av_frame_free(&sc.frame);
 #endif
 
 #ifdef DO_ENCODE
-    av_write_trailer(o.fmt_ctx);
-    av_packet_free(&o.packet);
-    avcodec_free_context(&o.enc_ctx);
-    avcodec_close(o.enc_ctx);
-    avformat_close_input(&o.fmt_ctx);
+    av_write_trailer(oc.fmt_ctx);
+    av_packet_free(&oc.packet);
+    avcodec_free_context(&oc.enc_ctx);
+    avcodec_close(oc.enc_ctx);
+    avformat_close_input(&oc.fmt_ctx);
 #endif
-    av_packet_free(&i.packet);
-    avformat_free_context(i.fmt_ctx);
+    av_packet_free(&ic.packet);
+    avformat_free_context(ic.fmt_ctx);
 
     return 0;
 }
