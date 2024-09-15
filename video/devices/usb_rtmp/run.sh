@@ -19,6 +19,7 @@ case ${cmd} in
         sh -c './usb_rtmp enc mpegts libx264 ../../../stream/video/h264/cuc_ieschool.h264 test.ts'
         ;;
    *)  
+       echo "`basename ${0}`:usage: [uvc] | [vod] | [enc]"
       exit 1
       ;; 
 esac

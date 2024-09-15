@@ -10,7 +10,8 @@
 #include <linux/videodev2.h>
 #include "log.h"
 
-#define BUFFER_COUNT 4
+#define BUFFER_COUNT    4
+#define DUMP_JPEG_NAME  "1.jpeg"
 
 int main(int argc, char** argv)
 {
@@ -89,8 +90,14 @@ int main(int argc, char** argv)
         return -1;
     }
 
-    FILE *fp = fopen("1.jpg", "w+");
+    FILE *fp = fopen(DUMP_JPEG_NAME, "w+");
+    if (!fp) {
+        log_err("%s open %s failed", dev_name, DUMP_JPEG_NAME);
+        return -1;
+    }
+
     fwrite(buf_addr[d_buf.index], d_buf.length, 1, fp);
+
     fclose(fp);
 
     ret = ioctl(fd, VIDIOC_QBUF, &d_buf);

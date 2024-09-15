@@ -7,16 +7,39 @@
 #include <linux/videodev2.h>
 #include <libavutil/imgutils.h>
 #include <libavcodec/avcodec.h>
+#include <libavutil/timestamp.h>
 #include <libavformat/avformat.h>
 #include <libavdevice/avdevice.h>
 #include "log.h"
 
+#define ENC_FPS       30
+#define ENC_GOP       30
+#define ENC_WIDTH     1280
+#define ENC_HEIGHT    720
 #define MAX_CHANNEL       (4)
-#define REQ_BUF_COUNT     (16)
-#define AV_IO_BUF_SIZE    (1920*1080*3)
+#define REQ_BUF_COUNT     (32)
+#define AV_IO_BUF_SIZE    (1280*720*3*10)
 #define VERSION_MAJOR(x)  ((x >> 16) & 0xff)
 #define VERSION_MINOR(x)  ((x >> 8)  & 0xff)
 #define VERSION_MICRO(x)  ((x)       & 0xff)
+
+typedef struct InputContext {
+    FILE* fp;
+    int a_idx;
+    int v_idx;
+    AVFrame*  frame;
+    AVPacket* packet;
+    AVCodecContext*  a_ctx;
+    AVCodecContext*  v_ctx;
+    AVFormatContext* fmt_ctx;
+} InputContext;
+
+typedef struct OutputContext {
+    AVStream* stream;
+    AVPacket* packet;
+    AVCodecContext*  enc_ctx;
+    AVFormatContext* fmt_ctx;
+} OutputContext;
 
 struct buffer {
     void   *start;
@@ -349,15 +372,15 @@ int read_packet(void *opaque, uint8_t *buf, int buf_size)
     return (int)frame_len;
 }
 
-AVFormatContext* open_input(struct usb_camera* cam, AVIOContext **avio_ctx)
+int open_input(struct usb_camera* cam, AVIOContext **avio_ctx, InputContext* ic)
 {
     int ret = -1;
     size_t avio_ctx_buffer_size = AV_IO_BUF_SIZE;
 
-    AVFormatContext* ifmt_ctx = avformat_alloc_context();
-    if (!ifmt_ctx) {
+    ic->fmt_ctx = avformat_alloc_context();
+    if (!ic->fmt_ctx) {
         log_err("avformat_alloc_context failed!\n");
-        return NULL;
+        return -1;
     }
 
     uint8_t* avio_ctx_buffer = (uint8_t*)av_malloc(avio_ctx_buffer_size);
@@ -368,96 +391,277 @@ AVFormatContext* open_input(struct usb_camera* cam, AVIOContext **avio_ctx)
     }
 
     *avio_ctx = avio_alloc_context(avio_ctx_buffer, avio_ctx_buffer_size,
-                                  0, cam, read_packet, NULL, NULL);
+                                   0, cam, read_packet, NULL, NULL);
     if (!*avio_ctx) {
         log_err("avio_alloc_context failed");
 
         goto failed;
     }
 
-    ifmt_ctx->pb    = *avio_ctx;
-    ifmt_ctx->flags = AVFMT_FLAG_CUSTOM_IO;
-    ret = avformat_open_input(&ifmt_ctx, NULL, NULL, NULL);
+    ic->fmt_ctx->pb    = *avio_ctx;
+    ic->fmt_ctx->flags = AVFMT_FLAG_CUSTOM_IO;
+    ret = avformat_open_input(&ic->fmt_ctx, NULL, NULL, NULL);
     if (ret < 0) {
         log_err("avformat_open_input failed, error(%s)", av_err2str(ret));
 
         goto failed;
     }
 
-    ret = avformat_find_stream_info(ifmt_ctx, NULL);
+    ret = avformat_find_stream_info(ic->fmt_ctx, NULL);
     if (ret != 0) {
         log_err("avformat_find_stream_info failed, error(%s)", av_err2str(ret));
 
         goto failed;
     }
 
-    av_dump_format(ifmt_ctx, 0, NULL, 0);
+    av_dump_format(ic->fmt_ctx, 0, NULL, 0);
 
-    return ifmt_ctx;
+    for (int i = 0; i < ic->fmt_ctx->nb_streams; i++) {
+        AVStream* stream = ic->fmt_ctx->streams[i];
+        AVCodecParameters* codecpar = stream->codecpar;
+
+        if (codecpar->codec_type != AVMEDIA_TYPE_AUDIO &&
+            codecpar->codec_type != AVMEDIA_TYPE_VIDEO) {
+            continue;
+        }
+
+        const AVCodec* codec = avcodec_find_decoder(codecpar->codec_id);
+        if (!codec) {
+            log_err("avcodec_find_decoder %s failed\n", avcodec_get_name(codecpar->codec_id));
+            return -1;
+        }
+
+        AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
+        if (!codec_ctx) {
+            log_err("avcodec_alloc_context3 failed\n");
+            return -1;
+        }
+
+        ret = avcodec_parameters_to_context(codec_ctx, codecpar);
+        if (ret < 0) {
+            log_err("avcodec_parameters_to_context failed");
+            return -1;
+        }
+
+        ret = avcodec_open2(codec_ctx, codec, NULL);
+        if (ret < 0) {
+            log_err("avcodec_open2 failed, error(%s)", av_err2str(ret));
+            return -1;
+        }
+
+        codec_ctx->time_base = stream->time_base;
+
+        if (codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            ic->a_idx = i;
+            ic->a_ctx = codec_ctx;
+            log_info("audio codec %s", avcodec_get_name(codecpar->codec_id));
+        } else if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            ic->v_idx = i;
+            ic->v_ctx = codec_ctx;
+            log_info("video codec %s, delay %d", avcodec_get_name(codecpar->codec_id), codecpar->video_delay);
+        }
+    }
+
+    ic->packet = av_packet_alloc();
+    if (!ic->packet) {
+        log_err("av_packet_alloc failed\n");
+        return -1;
+    }
+
+    ic->frame = av_frame_alloc();
+    if (!ic->frame) {
+        log_err("av_frame_alloc failed\n");
+        return -1;
+    }
+
+    return 0;
 
 failed:
 
-    return NULL;
+    return -1;
 }
 
-AVFormatContext* open_output(AVFormatContext *ifmt_ctx, int* video_index)
+int open_output(InputContext* ic, int* video_index, OutputContext* oc)
 {
     int ret = -1;
-    AVFormatContext * ofmt_ctx = NULL;
+    char* venc_name = "libx264";
+    const char *out_format = "flv";
     const char *url = "rtmp://192.168.174.128:1936/live/test";
 
-    ret = avformat_alloc_output_context2(&ofmt_ctx, NULL, "flv", url);
-    if (ret < 0) {
-        log_err("avformat_alloc_output_context2 failed, error(%s)", av_err2str(ret));
-
-        goto failed;
+    oc->packet = av_packet_alloc();
+    if (!oc->packet) {
+        log_err("av_packet_alloc failed\n");
+        return -1;
     }
 
-    for (unsigned int i = 0; i < ifmt_ctx->nb_streams; i++) {
-        AVStream *in_stream = ifmt_ctx->streams[i];
-        if (ifmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            *video_index = i;
-        }
+    oc->fmt_ctx = avformat_alloc_context();
+    if (!oc->fmt_ctx) {
+        log_err("avformat_alloc_context failed");
+        return -1;
+    }
 
-        AVStream *out_stream = avformat_new_stream(ofmt_ctx, NULL);
-        if (!out_stream) {
-            log_err("avformat_new_stream failed\n");
-            ret = AVERROR_UNKNOWN;
-            goto failed;
-        }
+    ret = avformat_alloc_output_context2(&oc->fmt_ctx, NULL, out_format, url);
+    if (ret < 0) {
+        log_err("avformat_alloc_output_context2 failed, error=%d(%s)", ret, av_err2str(ret));
+        return -1;
+    }
 
-        ret = avcodec_parameters_copy(out_stream->codecpar, in_stream->codecpar);
+    oc->stream = avformat_new_stream(oc->fmt_ctx, NULL);
+    if (!oc->stream) {
+        log_err("avformat_new_stream failed");
+        return -1;
+    }
+
+    const AVCodec *enc_codec = avcodec_find_encoder_by_name(venc_name);
+    if (!enc_codec) {
+        log_err("avcodec_find_encoder failed");
+        return -1;
+    }
+
+    oc->enc_ctx = avcodec_alloc_context3(enc_codec);
+    if (!oc->enc_ctx) {
+        log_err("avcodec_alloc_context3 failed");
+        return -1;
+    }
+
+    oc->enc_ctx->bit_rate   = 110000;
+    oc->enc_ctx->gop_size   = ENC_GOP;
+    oc->enc_ctx->width      = ENC_WIDTH;
+    oc->enc_ctx->height     = ENC_HEIGHT;
+    oc->enc_ctx->codec_id   = enc_codec->id;
+    oc->enc_ctx->pix_fmt    = AV_PIX_FMT_YUV420P;
+    oc->enc_ctx->codec_type = AVMEDIA_TYPE_VIDEO;
+    oc->enc_ctx->time_base  = (AVRational){ 1, ENC_FPS };
+
+    if (oc->enc_ctx->codec_id == AV_CODEC_ID_H264 ||
+        oc->enc_ctx->codec_id == AV_CODEC_ID_H265) {
+        oc->enc_ctx->qmin         = 10;
+        oc->enc_ctx->qmax         = 51;
+        oc->enc_ctx->qcompress    = 0.6;
+        oc->enc_ctx->max_b_frames = 2;
+    } else if (oc->enc_ctx->codec_id == AV_CODEC_ID_MPEG2VIDEO) {
+        oc->enc_ctx->max_b_frames = 2;
+    } else if (oc->enc_ctx->codec_id == AV_CODEC_ID_MPEG1VIDEO) {
+        oc->enc_ctx->mb_decision  = 2;
+    }
+
+    if (oc->fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER)
+        oc->enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+    ret = avcodec_open2(oc->enc_ctx, enc_codec, NULL);
+    if (ret < 0) {
+        log_err("avcodec_open2 failed, error=%d(%s)", ret, av_err2str(ret));
+        return -1;
+    }
+
+    ret = avcodec_parameters_from_context(oc->stream->codecpar, oc->enc_ctx);
+    if (ret < 0) {
+        log_err("avcodec_parameters_from_context failed, error(%s)", av_err2str(ret));
+        return -1;
+    }
+
+    oc->stream->time_base    = oc->enc_ctx->time_base;
+    oc->stream->r_frame_rate = av_inv_q(oc->enc_ctx->time_base);
+
+    log_info("rtmp stream: %s", url);
+    av_dump_format(oc->fmt_ctx, 0, url, 1);
+
+    if (!(oc->fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
+        ret = avio_open(&oc->fmt_ctx->pb, url, AVIO_FLAG_READ_WRITE);
         if (ret < 0) {
-            log_err("avcodec_parameters_copy failed, error(%s)\n", av_err2str(ret));
+            log_err("avio_open failed, error=%d(%s)", ret, av_err2str(ret));
+            return -1;
         }
-
-        out_stream->codecpar->codec_tag = 0;
-        out_stream->codecpar->codec_id  = AV_CODEC_ID_H264;
     }
 
-    av_dump_format(ofmt_ctx, 0, url, 1);
-
-    ret = avio_open(&ofmt_ctx->pb, url, AVIO_FLAG_WRITE);
+    ret = avformat_write_header(oc->fmt_ctx, NULL);
     if (ret < 0) {
-        log_err("avio_open failed, error(%s)", av_err2str(ret));
-
-        goto failed;
+        log_err("avformat_write_header failed, error=%d(%s)", ret, av_err2str(ret));
+        return -1;
     }
 
-    ret = avformat_write_header(ofmt_ctx, NULL);
-    if (ret < 0) {
-        log_err("avformat_write_header failed, error(%s)\n", av_err2str(ret));
-
-        goto failed;
-    }
-
-    return ofmt_ctx;
-
-failed:
-    return NULL;
+    return 0;
 }
 
-int remux(AVFormatContext *ifmt_ctx, AVFormatContext * ofmt_ctx, int video_index)
+void encode_process(AVFormatContext *fmt_ctx, AVCodecContext *enc_ctx,
+                    AVStream *stream, AVFrame* sws_frame, AVPacket* packet)
+{
+    int ret = -1;
+
+    ret = avcodec_send_frame(enc_ctx, sws_frame);
+    if (ret < 0) {
+        //log_err("avcodec_send_frame failed, error(%s)\n", av_err2str(ret));
+        return;
+    }
+
+    ret = avcodec_receive_packet(enc_ctx, packet);
+    if (ret < 0) {
+        //log_err("avcodec_receive_packet failed, error(%s)\n", av_err2str(ret));
+        return;
+    }
+
+    av_packet_rescale_ts(packet, enc_ctx->time_base, stream->time_base);
+
+    //log_info("receive video packet, pts(%ss %s) dts(%ss %s)",
+    //          av_ts2timestr(packet->pts, &stream->time_base), av_ts2str(packet->pts),
+    //          av_ts2timestr(packet->dts, &stream->time_base), av_ts2str(packet->dts));
+
+    packet->pos = -1;
+    packet->stream_index = stream->index;
+    av_interleaved_write_frame(fmt_ctx, packet);
+
+    av_packet_unref(packet);
+}
+
+void decode_process(InputContext* i, OutputContext* o)
+{
+    int ret = -1;
+
+    ret = avcodec_send_packet(i->v_ctx, i->packet);
+    if (ret < 0) {
+        log_err("avcodec_send_packet failed, error(%s)\n", av_err2str(ret));
+        return;
+    }
+
+    while (ret >= 0) {
+        ret = avcodec_receive_frame(i->v_ctx, i->frame);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+            return;
+        else if (ret < 0) {
+            log_err("avcodec_receive_frame failed, error(%s)\n", av_err2str(ret));
+            return;
+        }
+
+        encode_process(o->fmt_ctx, o->enc_ctx, o->stream, i->frame, o->packet);
+    }
+}
+
+int remux(InputContext* ic, OutputContext* oc, int video_index)
+{
+    while (av_read_frame(ic->fmt_ctx, ic->packet) >= 0) {
+        if (ic->packet->stream_index == ic->v_idx) {
+            ic->packet->pts = ic->v_ctx->frame_number;
+            decode_process(ic, oc);
+        } else if (ic->packet->stream_index == ic->a_idx) {
+            ic->packet->pts = ic->a_ctx->frame_number;
+            decode_process(ic, oc);
+        }
+
+        av_packet_unref(ic->packet);
+    }
+
+    if (ic->v_ctx) {
+        ic->packet = NULL;
+        decode_process(ic, oc);
+    } else if (ic->a_ctx) {
+        ic->packet = NULL;
+        decode_process(ic, oc);
+    }
+
+    return 0;
+}
+
+int remux_debug(InputContext* ic, OutputContext* oc, int video_index)
 {
     int ret = -1;
     long long frame_index = 0;
@@ -472,12 +676,12 @@ int remux(AVFormatContext *ifmt_ctx, AVFormatContext * ofmt_ctx, int video_index
     }
 
     while (1) {
-        ret = av_read_frame(ifmt_ctx, packet);
+        ret = av_read_frame(ic->fmt_ctx, packet);
         if (ret < 0) break;
 
         if (packet->pts == AV_NOPTS_VALUE) {
-            AVRational time_base = ifmt_ctx->streams[video_index]->time_base;
-            int64_t calc_duration = (double)AV_TIME_BASE / av_q2d(ifmt_ctx->streams[video_index]->r_frame_rate);
+            AVRational time_base = ic->fmt_ctx->streams[video_index]->time_base;
+            int64_t calc_duration = (double)AV_TIME_BASE / av_q2d(ic->fmt_ctx->streams[video_index]->r_frame_rate);
 
             packet->pts = (double)(frame_index*calc_duration) / (double)(av_q2d(time_base)*AV_TIME_BASE);
             packet->dts = packet->pts;
@@ -485,12 +689,12 @@ int remux(AVFormatContext *ifmt_ctx, AVFormatContext * ofmt_ctx, int video_index
         }
 
         if (packet->stream_index == video_index) {
-            AVRational time_base = ifmt_ctx->streams[video_index]->time_base;
+            AVRational time_base = ic->fmt_ctx->streams[video_index]->time_base;
             AVRational time_base_q = { 1, AV_TIME_BASE };
             int64_t pts_time = av_rescale_q(packet->dts, time_base, time_base_q);
             int64_t now_time = av_gettime() - start_time;
 
-            AVRational avr = ifmt_ctx->streams[video_index]->time_base;
+            AVRational avr = ic->fmt_ctx->streams[video_index]->time_base;
             printf("avr.num:%d, avr.den:%d, packet.dts:%ld, packet.pts:%ld, pts_time:%ld\n",
                     avr.num,    avr.den,    packet->dts,    packet->pts,    pts_time);
 
@@ -500,8 +704,8 @@ int remux(AVFormatContext *ifmt_ctx, AVFormatContext * ofmt_ctx, int video_index
             }
         }
 
-        in_stream  = ifmt_ctx->streams[packet->stream_index];
-        out_stream = ofmt_ctx->streams[packet->stream_index];
+        in_stream  = ic->fmt_ctx->streams[packet->stream_index];
+        out_stream = oc->fmt_ctx->streams[packet->stream_index];
 
         packet->pos = -1;
         packet->pts = av_rescale_q_rnd(packet->pts, in_stream->time_base, out_stream->time_base, (AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
@@ -512,7 +716,7 @@ int remux(AVFormatContext *ifmt_ctx, AVFormatContext * ofmt_ctx, int video_index
             frame_index++;
         }
 
-        ret = av_interleaved_write_frame(ofmt_ctx, packet);
+        ret = av_interleaved_write_frame(oc->fmt_ctx, packet);
         if (ret < 0) {
             log_err("av_interleaved_write_frame failed, error(%s)\n", av_err2str(ret));
             break;
@@ -526,12 +730,15 @@ int remux(AVFormatContext *ifmt_ctx, AVFormatContext * ofmt_ctx, int video_index
     return 0;
 }
 
+// TODO decode MJPEG + encode H26x
 // ffmpeg -f v4l2 -list_formats all -i /dev/video0
 // ./ffmpeg_usb_rtmp /dev/video0 1280 720 30 1500000
 int main(int argc, char* argv[])
 {
     int ret = -1;
     int video_index = -1;
+    InputContext  ic = {0};
+    OutputContext oc = {0};
     AVIOContext *avio_ctx = NULL;
     struct usb_camera usb_cam = {0};
 
@@ -555,17 +762,17 @@ int main(int argc, char* argv[])
         return -1;
     }
 
-    AVFormatContext *ifmt_ctx = open_input(&usb_cam, &avio_ctx);
-    if (ifmt_ctx == NULL) {
+    ret = open_input(&usb_cam, &avio_ctx, &ic);
+    if (ret < 0) {
         goto end;
     }
 
-    AVFormatContext * ofmt_ctx = open_output(ifmt_ctx, &video_index);
-    if (ofmt_ctx == NULL) {
+    ret = open_output(&ic, &video_index, &oc);
+    if (ret < 0) {
         goto end;
     }
 
-    ret = remux(ifmt_ctx, ofmt_ctx, video_index);
+    ret = remux(&ic, &oc, video_index);
     if (ret < 0) {
         goto end;
     }
@@ -577,9 +784,9 @@ int main(int argc, char* argv[])
     }
 
 end:
-    if (ofmt_ctx) avformat_free_context(ofmt_ctx);
+    if (oc.fmt_ctx) avformat_free_context(oc.fmt_ctx);
     if (avio_ctx) avio_context_free(&avio_ctx);
-    if (ifmt_ctx) avformat_free_context(ifmt_ctx);
+    if (ic.fmt_ctx) avformat_free_context(ic.fmt_ctx);
 
     log_info("capture_deinit");
     capture_deinit(&usb_cam);
